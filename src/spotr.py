@@ -1,6 +1,6 @@
 import jax
 import jax.numpy as jnp
-import tensorflow_probability as tfp
+from tensorflow_probability.substrates import jax as tfp
 import optax
 from tqdm import tqdm
 
@@ -108,20 +108,14 @@ def sinkhorn_unrolled(C, a, b, eps, T, uv0=None):
     gamma = (u[:, None]) * K * (v[None, :])  # diag(u) @ K @ diag(v)
     return gamma, (u, v)
 
-def make_step_fn(C_feature, Y, C_tree, C_space, a, b, eps, optimizer, cell_type_assignments, cell_type_signatures, sigma, T_sinkhorn=50, J_alt=3, detach_gamma_in_C=False):
-    """
-    detach_gamma_in_C = True will stop gradients through γ inside C(α,γ),
-    giving a block-coordinate (partial) gradient often used for stability.
-    """
-
+def make_step_fn(C_feature, Y, C_tree, C_space, a, b, eps, optimizer, cell_type_assignments, cell_type_signatures, sigma, T_sinkhorn=50, J_alt=3):
     def loss_fn(beta, gamma_uv):
         gamma0, uv0 = gamma_uv
         alpha = jax.nn.sigmoid(beta)  # α ∈ (0,1)
 
-        gamma_arg = jax.lax.stop_gradient(gamma0) if detach_gamma_in_C else gamma0
         # First alternating round uses gamma0 inside C; subsequent rounds are unrolled
         def one_round(gamma, uv):
-            C = build_fgw_cost(alpha, C_feature, C_tree, C_space, a, b, (jax.lax.stop_gradient(gamma) if detach_gamma_in_C else gamma))
+            C = build_fgw_cost(alpha, C_feature, C_tree, C_space, a, b, gamma)
             return sinkhorn_unrolled(C, a, b, eps, T_sinkhorn, uv)
 
         # Unroll J_alt rounds with carry
