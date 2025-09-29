@@ -143,7 +143,7 @@ def learn_alpha_gamma(
     cell_type_assignments, cell_type_signatures, sigma,
     eps=0.05, T_sinkhorn=50, J_alt=3,
     K_outer=200, lr=1e-2, beta0=0.0,
-    gamma0=None, uv0=None, detach_gamma_in_C=False,
+    gamma0=None, uv0=None,
 ):
     n = a.shape[0]; m = b.shape[0]
     if gamma0 is None:
@@ -156,7 +156,7 @@ def learn_alpha_gamma(
     beta = jnp.array(beta0)
     opt_state = optimizer.init(beta)
 
-    step = make_step_fn(C_feature, Y, C_tree, C_space, a, b, eps, optimizer, cell_type_assignments, cell_type_signatures, sigma, T_sinkhorn, J_alt, detach_gamma_in_C)
+    step = make_step_fn(C_feature, Y, C_tree, C_space, a, b, eps, optimizer, cell_type_assignments, cell_type_signatures, sigma, T_sinkhorn, J_alt)
 
     gamma_uv = (gamma0, uv0)
     loss_hist, alpha_hist = [], []
