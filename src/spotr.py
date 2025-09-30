@@ -108,6 +108,46 @@ def sinkhorn_unrolled(C, a, b, eps, T, uv0=None):
     gamma = (u[:, None]) * K * (v[None, :])  # diag(u) @ K @ diag(v)
     return gamma, (u, v)
 
+def sinkhorn_fgw(C_feature, C_tree, C_space, a, b, eps, T_sinkhorn=50, J_alt=3, alpha=0.5, gamma0=None, uv0=None):
+    # First alternating round uses gamma0 inside C; subsequent rounds are unrolled
+    def one_round(gamma, uv):
+        C = build_fgw_cost(alpha, C_feature, C_tree, C_space, a, b, gamma)
+        return sinkhorn_unrolled(C, a, b, eps, T_sinkhorn, uv)
+
+    # Unroll J_alt rounds with carry
+    def body(carry, _):
+        gamma, uv = carry
+        gamma, uv = one_round(gamma, uv)
+        return (gamma, uv), None
+
+    if gamma0 is None:
+        gamma0 = (a[:, None] * b[None, :])
+    if uv0 is None:
+        uv0 = (jnp.ones_like(a), jnp.ones_like(b))
+
+    (gamma_star, uv_star), _ = jax.lax.scan(body, (gamma0, uv0), xs=None, length=J_alt)
+    return gamma_star, uv_star
+
+def sinkhorn_cladefgw(C_feature, C_tree, C_space, a, b, eps, omega, Omega, T_sinkhorn=50, J_alt=3, alpha=0.5, gamma0=None, uv0=None):
+    # First alternating round uses gamma0 inside C; subsequent rounds are unrolled
+    def one_round(gamma, uv):
+        C = build_cladefgw_cost(alpha, C_feature, C_tree, C_space, a, b, gamma, omega, Omega)
+        return sinkhorn_unrolled(C, a, b, eps, T_sinkhorn, uv)
+
+    # Unroll J_alt rounds with carry
+    def body(carry, _):
+        gamma, uv = carry
+        gamma, uv = one_round(gamma, uv)
+        return (gamma, uv), None
+
+    if gamma0 is None:
+        gamma0 = (a[:, None] * b[None, :])
+    if uv0 is None:
+        uv0 = (jnp.ones_like(a), jnp.ones_like(b))
+
+    (gamma_star, uv_star), _ = jax.lax.scan(body, (gamma0, uv0), xs=None, length=J_alt)
+    return gamma_star, uv_star    
+
 def make_step_fn(C_feature, Y, C_tree, C_space, a, b, eps, optimizer, cell_type_assignments, cell_type_signatures, sigma, T_sinkhorn=50, J_alt=3):
     def loss_fn(beta, gamma_uv):
         gamma0, uv0 = gamma_uv
@@ -161,11 +201,12 @@ def learn_alpha_gamma(
     gamma_uv = (gamma0, uv0)
     loss_hist, alpha_hist = [], []
 
-    for _ in tqdm(range(K_outer)):
-        print(beta)
-        beta, opt_state, gamma_uv, loss_value, alpha = step(beta, opt_state, gamma_uv)
-        loss_hist.append(float(loss_value))
-        alpha_hist.append(float(alpha))
+    with tqdm(range(K_outer)) as pbar:
+        for _ in pbar:
+            beta, opt_state, gamma_uv, loss_value, alpha = step(beta, opt_state, gamma_uv)
+            loss_hist.append(float(loss_value))
+            alpha_hist.append(float(alpha))
+            pbar.set_postfix({'loss': float(loss_value)})
 
     alpha_final = jax.nn.sigmoid(beta)
     return float(alpha_final), jnp.array(alpha_hist), jnp.array(loss_hist), gamma_uv[0]
