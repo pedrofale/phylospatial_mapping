@@ -164,6 +164,37 @@ class BrownianSpatialDataSimulator(SpatialDataSimulator):
 
         return Sigma_p, L
 
+    def rescale_clades(self, clades, rates):
+        Sigma = self.leaf_cov_matrix.values
+        n = Sigma.shape[0]
+        Sigma_p = Sigma.copy()
+
+        # Check disjointness
+        all_idx = []
+        for leaves in clades:
+            all_idx.extend(self._indices_for_clade(self.leaf_names, leaves).tolist())
+        if len(set(all_idx)) != len(all_idx):
+            raise ValueError("Clades overlap: at least one tip appears in multiple clades.")
+
+        # Apply each clade’s rescale
+        for leaves, lam in zip(clades, rates):
+            I = self._indices_for_clade(self.leaf_names, leaves)
+            lam = float(lam)
+            if lam < 0:
+                raise ValueError("rates must be nonnegative.")
+            d_root = self._clade_root_depth(Sigma, I)
+
+            # Inside-clade component A_C = Σ[I,I] - d_root
+            S_block = Sigma[np.ix_(I, I)] - d_root
+            # Update Σ′ on that block
+            Sigma_p[np.ix_(I, I)] += (lam - 1.0) * S_block
+
+        # Symmetrize to clean numerical dust
+        Sigma_p = 0.5 * (Sigma_p + Sigma_p.T)
+        eps = 1e-10 * np.mean(np.diag(Sigma_p))
+        L = np.linalg.cholesky(Sigma_p + eps*np.eye(Sigma_p.shape[0]))
+
+        return Sigma_p, L
 
     def sample_brownian_motion(self, D=1., lambda_brownian=1., clades=None, rates=None):
         # Use Cholesky decomposition for efficient sampling
@@ -174,8 +205,7 @@ class BrownianSpatialDataSimulator(SpatialDataSimulator):
             leaf_cholesky = self.leaf_cholesky
 
         if clades is not None:
-            for clade, rate in zip(clades, rates):
-                _, leaf_cholesky = self.rescale_clade(clade, rate)
+            _, leaf_cholesky = self.rescale_clades(clades, rates)
 
         V_chol = np.kron(np.diag(np.ones(self.dim)) * np.sqrt(D), leaf_cholesky)
         # Sample standard normals

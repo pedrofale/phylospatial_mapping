@@ -1,4 +1,4 @@
-from typing import Optional
+from typing import Optional, List, Iterable
 
 import numpy as np
 import pandas as pd
@@ -41,6 +41,7 @@ class ExpressionSimulator(DataSimulator):
         random_seed: Optional[int] = None,
     ):
         self.trait_covariances = trait_covariances # gene-gene covariance matrix
+        self.trait_cholesky = np.asarray(cholesky(self.trait_covariances.values, lower=True))
         self.spatial_map = spatial_map # spatial heatmap indicating the activity of the spatial program at each pixel
         self.spatial_program = spatial_program # spatial program indicating the activity of each gene
         self.random_seed = random_seed
@@ -87,12 +88,110 @@ class ExpressionSimulator(DataSimulator):
         self.n_leaves = len(self.leaf_cov_matrix)
         self.leaf_names = self.leaf_cov_matrix.index
 
-    def sample_brownian_motion(self):
-        V = np.kron(self.trait_covariances, self.leaf_cov_matrix)
-        # Sample from the multivariate normal distribution
-        leaf_trait_values = np.random.multivariate_normal(np.zeros((self.n_genes*self.n_leaves,)), V) # zero-mean
-        leaf_trait_values = leaf_trait_values.reshape(self.n_leaves, -1, order='F') # leaves by genes
-        return pd.DataFrame(leaf_trait_values, index=self.leaf_names, columns=self.trait_covariances.index) # is this in the right order?
+    def _indices_for_clade(self, tip_labels: List[str], leaves: Iterable[str]) -> np.ndarray:
+        idx = {t: i for i, t in enumerate(tip_labels)}
+        I = np.array([idx[t] for t in leaves], dtype=int)
+        if len(np.unique(I)) != len(I):
+            raise ValueError("Duplicate tips in a clade.")
+        return I
+
+    def _clade_root_depth(self, Sigma: np.ndarray, I: np.ndarray) -> float:
+        """
+        Depth (shared path length) from the tree root to the clade root.
+        For |I|>=2: min off-diagonal within the clade.
+        For |I|==1: parent depth = max off-diagonal in that tip's row.
+        """
+        if I.size == 1:
+            i = I[0]
+            if Sigma.shape[0] == 1:
+                return 0.0
+            return float(np.max(np.delete(Sigma[i, :], i)))
+        S = Sigma[np.ix_(I, I)]
+        mask = ~np.eye(S.shape[0], dtype=bool)
+        return float(np.min(S[mask]))
+
+    def rescale_clade(self, leaves, lam):
+        """
+        Rescale the covariance matrix of a clade by a given rate.
+        Args:
+            tip_labels: The names of the tips of the clade to rescale.
+            lam: The rescaling factor of the covariance matrix of the clade.
+        Returns:
+            The rescaled covariance matrix and Cholesky decomposition.
+        """
+        Sigma = self.leaf_cov_matrix.values
+        n = Sigma.shape[0]
+        Sigma_p = Sigma.copy()
+
+        I = self._indices_for_clade(self.leaf_names, leaves)
+        lam = float(lam)
+        if lam < 0:
+            raise ValueError("lam must be nonnegative.")
+        d_root = self._clade_root_depth(Sigma, I)
+
+        # Inside-clade component A_C = Σ[I,I] - d_root
+        S_block = Sigma[np.ix_(I, I)] - d_root
+        # Update Σ′ on that block
+        Sigma_p[np.ix_(I, I)] += (lam - 1.0) * S_block        
+
+        Sigma_p = 0.5 * (Sigma_p + Sigma_p.T)
+        eps = 1e-10 * np.mean(np.diag(Sigma_p))
+        L = np.linalg.cholesky(Sigma_p + eps*np.eye(Sigma_p.shape[0]))
+
+        return Sigma_p, L
+
+    def rescale_clades(self, clades, rates):
+        Sigma = self.leaf_cov_matrix.values
+        n = Sigma.shape[0]
+        Sigma_p = Sigma.copy()
+
+        # Check disjointness
+        all_idx = []
+        for leaves in clades:
+            all_idx.extend(self._indices_for_clade(self.leaf_names, leaves).tolist())
+        if len(set(all_idx)) != len(all_idx):
+            raise ValueError("Clades overlap: at least one tip appears in multiple clades.")
+
+        # Apply each clade’s rescale
+        for leaves, lam in zip(clades, rates):
+            I = self._indices_for_clade(self.leaf_names, leaves)
+            lam = float(lam)
+            if lam < 0:
+                raise ValueError("rates must be nonnegative.")
+            d_root = self._clade_root_depth(Sigma, I)
+
+            # Inside-clade component A_C = Σ[I,I] - d_root
+            S_block = Sigma[np.ix_(I, I)] - d_root
+            # Update Σ′ on that block
+            Sigma_p[np.ix_(I, I)] += (lam - 1.0) * S_block
+
+        # Symmetrize to clean numerical dust
+        Sigma_p = 0.5 * (Sigma_p + Sigma_p.T)
+        eps = 1e-10 * np.mean(np.diag(Sigma_p))
+        L = np.linalg.cholesky(Sigma_p + eps*np.eye(Sigma_p.shape[0]))
+
+        return Sigma_p, L
+
+    def sample_brownian_motion(self, clades=None, rates=None):
+        leaf_cholesky = self.leaf_cholesky
+        trait_cholesky = self.trait_cholesky
+
+        if clades is not None:
+            _, leaf_cholesky = self.rescale_clades(clades, rates)
+
+        V_chol = np.kron(trait_cholesky, leaf_cholesky)
+        # Sample standard normals
+        z = np.random.randn(self.n_genes * self.n_leaves)
+        # Transform to correlated samples
+        leaf_trait_values = V_chol @ z
+        leaf_trait_values = leaf_trait_values.reshape(self.n_leaves, -1, order='F')  # leaves by genes
+        return pd.DataFrame(leaf_trait_values, index=self.leaf_names, columns=self.gene_names)  # is this in the right order?
+
+        # V = np.kron(self.trait_covariances, self.leaf_cov_matrix)
+        # # Sample from the multivariate normal distribution
+        # leaf_trait_values = np.random.multivariate_normal(np.zeros((self.n_genes*self.n_leaves,)), V) # zero-mean
+        # leaf_trait_values = leaf_trait_values.reshape(self.n_leaves, -1, order='F') # leaves by genes
+        # return pd.DataFrame(leaf_trait_values, index=self.leaf_names, columns=self.trait_covariances.index) # is this in the right order?
 
     def sample_spatial_effects(self, tree):
         # For each cell, check where in the grid it is
@@ -104,14 +203,16 @@ class ExpressionSimulator(DataSimulator):
             leaf_spatial_effects.loc[leaf] = self.spatial_map[x, y] * self.spatial_program
         return leaf_spatial_effects 
 
-    def sample_combined_expression(self, tree, alpha=0.5):
-        expression = alpha*self.sample_brownian_motion() + (1-alpha)*self.sample_spatial_effects(tree)
+    def sample_combined_expression(self, tree, alpha=0.5, clades=None, rates=None):
+        expression = alpha*self.sample_brownian_motion(clades=clades, rates=rates) + (1-alpha)*self.sample_spatial_effects(tree)
         return expression
 
     def overlay_data(
         self,
         tree: CassiopeiaTree,
         alpha: float = 0.5,
+        clades: Optional[List[List[str]]] = None,
+        rates: Optional[List[float]] = None,
     ):
         """Overlays gene expression onto the AnnData object via Brownian motion on the tree and exogenous spatial effects.
 
@@ -128,7 +229,7 @@ class ExpressionSimulator(DataSimulator):
         if not hasattr(self, 'leaf_cov_matrix'):
             phylotree = ete3.Tree(tree.get_newick())
             self.make_leaf_cov_matrix(phylotree)
-        expression = self.sample_combined_expression(tree, alpha)
+        expression = self.sample_combined_expression(tree, alpha=alpha, clades=clades, rates=rates)
 
         # Set cell meta
         cell_meta = (
