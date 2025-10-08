@@ -3,7 +3,7 @@ import ot
 from ot.gromov import gromov_wasserstein, fused_gromov_wasserstein
 from scipy.stats import pearsonr
 
-def fgw(single_cell_data, spatial_data, tree_distance_matrix, space_distance_matrix, alpha=0.5):
+def fgwot(single_cell_data, spatial_data, tree_distance_matrix, space_distance_matrix, alpha=0.5):
     C1 = tree_distance_matrix   
     C2 = space_distance_matrix
     M = ot.dist(single_cell_data, spatial_data)
@@ -14,7 +14,7 @@ def fgw(single_cell_data, spatial_data, tree_distance_matrix, space_distance_mat
     T_fgw = fused_gromov_wasserstein(M, C1, C2, w1, w2, loss_fun='square_loss', alpha=alpha)
     return T_fgw
 
-def gw(tree_distance_matrix, space_distance_matrix):
+def gwot(tree_distance_matrix, space_distance_matrix):
     C1 = tree_distance_matrix
     C2 = space_distance_matrix
     w1 = ot.unif(C1.shape[0])
@@ -22,7 +22,7 @@ def gw(tree_distance_matrix, space_distance_matrix):
     T_gw = gromov_wasserstein(C1, C2, w1, w2, loss_fun='square_loss')
     return T_gw
 
-def optimal_transport(single_cell_data, spatial_data):
+def wot(single_cell_data, spatial_data):
     M = ot.dist(single_cell_data, spatial_data)
     T_ot = ot.emd([], [], M)
     return T_ot
