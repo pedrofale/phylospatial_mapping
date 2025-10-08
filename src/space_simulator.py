@@ -4,7 +4,7 @@ the SpatialDataSimulator. The BrownianSpatialDataSimulator simulates spatial
 coordinates by simulating Brownian motion of each cell.
 """
 from re import A
-from typing import Optional, Union
+from typing import Optional, Union, Iterable, List, Dict
 import numpy as np
 import pandas as pd
 import itertools
@@ -66,7 +66,7 @@ class BrownianSpatialDataSimulator(SpatialDataSimulator):
         self.scale_unit_area = scale_unit_area
         self.random_seed = random_seed
 
-    def make_leaf_cov_matrix(self, phylotree, lambda_brownian=1.,):
+    def make_leaf_cov_matrix(self, phylotree):
         # Create covariance matrix for species from tree 
         species_cov_matrix = pd.DataFrame(index=phylotree.get_leaf_names(), columns=phylotree.get_leaf_names())
         species_cov_matrix.index = species_cov_matrix.columns
@@ -102,16 +102,82 @@ class BrownianSpatialDataSimulator(SpatialDataSimulator):
         descend(phylotree.get_tree_root(), total_length=0)
         species_cov_matrix = species_cov_matrix.combine_first(species_cov_matrix.T)
         self.leaf_cov_matrix = species_cov_matrix.astype(float)
-        leaf_cov_matrix = np.diag(np.diag(self.leaf_cov_matrix))
-        self.leaf_cov_matrix = leaf_cov_matrix + lambda_brownian * (self.leaf_cov_matrix - leaf_cov_matrix)        
         self.leaf_cholesky = np.asarray(cholesky(self.leaf_cov_matrix.values, lower=True))
         self.n_leaves = len(self.leaf_cov_matrix)
         self.leaf_names = self.leaf_cov_matrix.index
 
-    def sample_brownian_motion(self, D=1.):
+    def pagels_lambda(self, lambda_brownian):
+        leaf_cov_matrix = np.diag(np.diag(self.leaf_cov_matrix))
+        leaf_cov_matrix = leaf_cov_matrix + lambda_brownian * (self.leaf_cov_matrix - leaf_cov_matrix)
+        leaf_cholesky = np.asarray(cholesky(leaf_cov_matrix.values, lower=True))
+        return leaf_cov_matrix, leaf_cholesky
+
+    def _indices_for_clade(self, tip_labels: List[str], leaves: Iterable[str]) -> np.ndarray:
+        idx = {t: i for i, t in enumerate(tip_labels)}
+        I = np.array([idx[t] for t in leaves], dtype=int)
+        if len(np.unique(I)) != len(I):
+            raise ValueError("Duplicate tips in a clade.")
+        return I
+
+    def _clade_root_depth(self, Sigma: np.ndarray, I: np.ndarray) -> float:
+        """
+        Depth (shared path length) from the tree root to the clade root.
+        For |I|>=2: min off-diagonal within the clade.
+        For |I|==1: parent depth = max off-diagonal in that tip's row.
+        """
+        if I.size == 1:
+            i = I[0]
+            if Sigma.shape[0] == 1:
+                return 0.0
+            return float(np.max(np.delete(Sigma[i, :], i)))
+        S = Sigma[np.ix_(I, I)]
+        mask = ~np.eye(S.shape[0], dtype=bool)
+        return float(np.min(S[mask]))
+
+    def rescale_clade(self, leaves, lam):
+        """
+        Rescale the covariance matrix of a clade by a given rate.
+        Args:
+            tip_labels: The names of the tips of the clade to rescale.
+            lam: The rescaling factor of the covariance matrix of the clade.
+        Returns:
+            The rescaled covariance matrix and Cholesky decomposition.
+        """
+        Sigma = self.leaf_cov_matrix.values
+        n = Sigma.shape[0]
+        Sigma_p = Sigma.copy()
+
+        I = self._indices_for_clade(self.leaf_names, leaves)
+        lam = float(lam)
+        if lam < 0:
+            raise ValueError("lam must be nonnegative.")
+        d_root = self._clade_root_depth(Sigma, I)
+
+        # Inside-clade component A_C = Σ[I,I] - d_root
+        S_block = Sigma[np.ix_(I, I)] - d_root
+        # Update Σ′ on that block
+        Sigma_p[np.ix_(I, I)] += (lam - 1.0) * S_block        
+
+        Sigma_p = 0.5 * (Sigma_p + Sigma_p.T)
+        eps = 1e-10 * np.mean(np.diag(Sigma_p))
+        L = np.linalg.cholesky(Sigma_p + eps*np.eye(Sigma_p.shape[0]))
+
+        return Sigma_p, L
+
+
+    def sample_brownian_motion(self, D=1., lambda_brownian=1., clades=None, rates=None):
         # Use Cholesky decomposition for efficient sampling
         # Build the block covariance matrix as before
-        V_chol = np.kron(np.diag(np.ones(self.dim)) * np.sqrt(D), self.leaf_cholesky)
+        if lambda_brownian != 1.:
+            _, leaf_cholesky = self.pagels_lambda(lambda_brownian)
+        else:
+            leaf_cholesky = self.leaf_cholesky
+
+        if clades is not None:
+            for clade, rate in zip(clades, rates):
+                _, leaf_cholesky = self.rescale_clade(clade, rate)
+
+        V_chol = np.kron(np.diag(np.ones(self.dim)) * np.sqrt(D), leaf_cholesky)
         # Sample standard normals
         z = np.random.randn(self.dim * self.n_leaves)
         # Transform to correlated samples
@@ -124,6 +190,8 @@ class BrownianSpatialDataSimulator(SpatialDataSimulator):
         tree: CassiopeiaTree,
         make_cov_matrix: bool = True,
         lambda_brownian: Union[float, np.ndarray] = 1.,
+        clades: Optional[List[List[str]]] = None,
+        rates: Optional[List[float]] = None,
         attribute_key: str = "spatial",
     ):
         """Overlays spatial data onto the CassiopeiaTree via Brownian motion.
@@ -140,10 +208,10 @@ class BrownianSpatialDataSimulator(SpatialDataSimulator):
 
         if make_cov_matrix and not hasattr(self, 'leaf_cov_matrix'):
             phylotree = ete3.Tree(tree.get_newick())
-            self.make_leaf_cov_matrix(phylotree, lambda_brownian=lambda_brownian)
+            self.make_leaf_cov_matrix(phylotree)
 
         if make_cov_matrix:
-            locations_df = self.sample_brownian_motion(D=self.diffusion_coefficient)
+            locations_df = self.sample_brownian_motion(D=self.diffusion_coefficient, lambda_brownian=lambda_brownian, clades=clades, rates=rates)
             locations = {tree.root: np.zeros(self.dim)}
             for child in tree.leaves_in_subtree(tree.root): # this is iterating through edges, not leaves, which what I have in my locations_df
                 locations[child] = locations_df.loc[child]
