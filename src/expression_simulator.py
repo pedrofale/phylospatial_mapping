@@ -28,7 +28,7 @@ class ExpressionSimulator(DataSimulator):
     The gene expression values for the leaves are added to the anndata object as a layer.
 
     Args:
-        trait_covariances: Gene-gene covariance matrix 
+        trait_covariances: trait-trait covariance matrix 
         spatial_covariances: Pixel-pixel covariance matrix
         random_seed: A seed for reproducibility
     """
@@ -36,16 +36,20 @@ class ExpressionSimulator(DataSimulator):
     def __init__(
         self,
         trait_covariances: np.ndarray,
+        trait_signatures: np.ndarray,
         spatial_map: np.ndarray,
         spatial_program: np.ndarray,
         random_seed: Optional[int] = None,
     ):
         self.trait_covariances = trait_covariances # gene-gene covariance matrix
         self.trait_cholesky = np.asarray(cholesky(self.trait_covariances.values, lower=True))
+        self.trait_signatures = trait_signatures # trait-trait signature matrix
         self.spatial_map = spatial_map # spatial heatmap indicating the activity of the spatial program at each pixel
-        self.spatial_program = spatial_program # spatial program indicating the activity of each gene
+        self.spatial_program = spatial_program # spatial program indicating the activity of each trait
         self.random_seed = random_seed
-        self.n_genes = trait_covariances.shape[0]
+        self.n_traits = trait_covariances.shape[0]
+        self.n_genes = trait_signatures.shape[1]
+        self.trait_names = ["T" + str(i) for i in range(self.n_traits)]
         self.gene_names = ["G" + str(i) for i in range(self.n_genes)]
         
     def make_leaf_cov_matrix(self, phylotree):
@@ -181,11 +185,11 @@ class ExpressionSimulator(DataSimulator):
 
         V_chol = np.kron(trait_cholesky, leaf_cholesky)
         # Sample standard normals
-        z = np.random.randn(self.n_genes * self.n_leaves)
+        z = np.random.randn(self.n_traits * self.n_leaves)
         # Transform to correlated samples
         leaf_trait_values = V_chol @ z
         leaf_trait_values = leaf_trait_values.reshape(self.n_leaves, -1, order='F')  # leaves by genes
-        return pd.DataFrame(leaf_trait_values, index=self.leaf_names, columns=self.gene_names)  # is this in the right order?
+        return pd.DataFrame(leaf_trait_values, index=self.leaf_names, columns=self.trait_names)  # is this in the right order?
 
         # V = np.kron(self.trait_covariances, self.leaf_cov_matrix)
         # # Sample from the multivariate normal distribution
@@ -204,8 +208,10 @@ class ExpressionSimulator(DataSimulator):
         return leaf_spatial_effects 
 
     def sample_combined_expression(self, tree, alpha=0.5, clades=None, rates=None):
-        expression = alpha*self.sample_brownian_motion(clades=clades, rates=rates) + (1-alpha)*self.sample_spatial_effects(tree)
-        return expression
+        brownian_motion_activations = self.sample_brownian_motion(clades=clades, rates=rates)
+        brownian_motion_expression = np.exp(brownian_motion_activations).dot(self.trait_signatures)
+        expression = alpha*brownian_motion_expression + (1-alpha)*self.sample_spatial_effects(tree)
+        return expression, brownian_motion_activations
 
     def overlay_data(
         self,
@@ -229,7 +235,7 @@ class ExpressionSimulator(DataSimulator):
         if not hasattr(self, 'leaf_cov_matrix'):
             phylotree = ete3.Tree(tree.get_newick())
             self.make_leaf_cov_matrix(phylotree)
-        expression = self.sample_combined_expression(tree, alpha=alpha, clades=clades, rates=rates)
+        expression, brownian_motion_activations = self.sample_combined_expression(tree, alpha=alpha, clades=clades, rates=rates)
 
         # Set cell meta
         cell_meta = (
@@ -242,4 +248,10 @@ class ExpressionSimulator(DataSimulator):
         cell_meta[columns] = np.nan
         for leaf in tree.leaves:
             cell_meta.loc[leaf, columns] = expression.loc[leaf]
+
+        columns = self.trait_names
+        cell_meta[columns] = np.nan
+        for leaf in tree.leaves:
+            cell_meta.loc[leaf, columns] = brownian_motion_activations.loc[leaf]
+
         tree.cell_meta = cell_meta
