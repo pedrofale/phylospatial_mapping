@@ -62,7 +62,7 @@ def build_fgw_cost(alpha, C_feature, C_tree, C_space, a, b, gamma, *args, **kwar
     Example (blend): C = (1 - alpha) * C_struct + alpha * C_feat
     """
     L_gw = compute_Lgw(C_tree, C_space, a, b, gamma)
-    return (1.0 - alpha) * C_feature * gamma + alpha * L_gw
+    return (1.0 - alpha) * C_feature + alpha * L_gw # alpha=0 doesn't seem to give the same result as POT w-ot because of the gamma multiplier of C_feature
 
 def build_cladefgw_cost(alpha, C_feature, C_tree, C_space, a, b, gamma, omega, Omega, *args, **kwargs):
     """
