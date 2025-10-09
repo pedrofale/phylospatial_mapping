@@ -215,14 +215,60 @@ class BrownianSpatialDataSimulator(SpatialDataSimulator):
         leaf_trait_values = leaf_trait_values.reshape(self.n_leaves, -1, order='F')  # leaves by dimensions
         return pd.DataFrame(leaf_trait_values, index=self.leaf_names, columns=['x', 'y'])  # is this in the right order?
 
+    def make_symmetric_displacement_means(self, phylotree, radius, theta):
+        # Create location means for symmetric displacement
+        self.location_means = pd.DataFrame(index=self.leaf_names, columns=['x', 'y'], dtype=float)
+
+        def descend(root, total_x=0, total_y=0):
+            clades = []
+            theta = np.random.uniform(0, 2*np.pi)
+            for i, child in enumerate(root.children):
+                clades.append(descend(child, total_x=total_x + -1**i * radius * np.cos(theta), total_y=total_y + -1**i * radius * np.sin(theta)))
+            if root.is_leaf():
+                self.location_means.loc[root.name, 'x'] = total_x
+                self.location_means.loc[root.name, 'y'] = total_y
+                return root.name
+            return clades
+
+        descend(phylotree.get_tree_root(), total_x=0, total_y=0)
+
+    def sample_symmetric_displacement(self, D=1., lambda_brownian=1., clades=None, rates=None, radius=1., theta=45.):
+        # Use Cholesky decomposition for efficient sampling
+        # Build the block covariance matrix as before
+        if lambda_brownian != 1.:
+            _, leaf_cholesky = self.pagels_lambda(lambda_brownian)
+        else:
+            leaf_cholesky = self.leaf_cholesky
+
+        if clades is not None:
+            _, leaf_cholesky = self.rescale_clades(clades, rates)
+
+        x_means, y_means = self.location_means['x'], self.location_means['y']
+
+        # X-locations
+        z_x = np.random.randn(self.n_leaves)
+        x_locations = (leaf_cholesky * np.sqrt(D)) @ z_x
+        x_locations = x_locations + x_means
+
+        # Y-locations
+        z_y = np.random.randn(self.n_leaves)
+        y_locations = (leaf_cholesky * np.sqrt(D)) @ z_y
+        y_locations = y_locations + y_means
+
+        leaf_trait_values = np.stack([x_locations, y_locations], axis=1)
+
+        return pd.DataFrame(leaf_trait_values, index=self.leaf_names, columns=['x', 'y'])  # is this in the right order?
+
     def overlay_data(
         self,
         tree: CassiopeiaTree,
-        make_cov_matrix: bool = True,
+        radius: float = 1.,
+        theta: float = 45.,
         lambda_brownian: Union[float, np.ndarray] = 1.,
         clades: Optional[List[List[str]]] = None,
         rates: Optional[List[float]] = None,
         attribute_key: str = "spatial",
+        brownian_motion: bool = True,
     ):
         """Overlays spatial data onto the CassiopeiaTree via Brownian motion.
 
@@ -236,26 +282,24 @@ class BrownianSpatialDataSimulator(SpatialDataSimulator):
         if self.random_seed:
             np.random.seed(self.random_seed)
 
-        if make_cov_matrix and not hasattr(self, 'leaf_cov_matrix'):
+        if not hasattr(self, 'leaf_cov_matrix'):
             phylotree = ete3.Tree(tree.get_newick())
             self.make_leaf_cov_matrix(phylotree)
 
-        if make_cov_matrix:
+        if brownian_motion:
             locations_df = self.sample_brownian_motion(D=self.diffusion_coefficient, lambda_brownian=lambda_brownian, clades=clades, rates=rates)
             locations = {tree.root: np.zeros(self.dim)}
             for child in tree.leaves_in_subtree(tree.root): # this is iterating through edges, not leaves, which what I have in my locations_df
                 locations[child] = locations_df.loc[child]
         else:
-            # Using numpy arrays instead of tuples for easy vector operations
+            if not hasattr(self, 'location_means'):
+                phylotree = ete3.Tree(tree.get_newick())
+                self.make_symmetric_displacement_means(phylotree, radius, theta)
+            locations_df = self.sample_symmetric_displacement(D=self.diffusion_coefficient, lambda_brownian=lambda_brownian, clades=clades, rates=rates, radius=radius, theta=theta)
             locations = {tree.root: np.zeros(self.dim)}
-            for parent, child in tree.depth_first_traverse_edges(source=tree.root):
-                parent_location = locations[parent]
-                branch_length = tree.get_branch_length(parent, child)
+            for child in tree.leaves_in_subtree(tree.root): # this is iterating through edges, not leaves, which what I have in my locations_df
+                locations[child] = locations_df.loc[child]
 
-                locations[child] = parent_location + np.random.normal(
-                    scale=np.sqrt(2 * self.diffusion_coefficient * branch_length),
-                    size=self.dim,
-                )
 
         # Scale if desired
         # Note that Python dictionaries preserve order since 3.6
