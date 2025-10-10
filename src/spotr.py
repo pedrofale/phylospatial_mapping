@@ -50,11 +50,13 @@ def compute_Lcladegw(C_T, C_S, a, b, gamma, Omega):
     CT2 = C_T * C_T
     CS2 = C_S * C_S
     # term1_i = sum_k (Omega_ik * CT2_ik) * a_k
-    term1_row = jnp.einsum('ik,ik,k->i', Omega, CT2, a)
-    term1 = term1_row[:, None]
-    term2 = jnp.einsum('ip,pm,mq->iq', Omega, gamma, CS2)          # Ω γ (C_S^2)^T
-    cross = jnp.einsum('ip,pm,mq->iq', C_T, gamma, C_S.T)          # C_T γ C_S^T
-    return term1 + term2 - 2.0 * (Omega @ cross)
+    term1 = (Omega * CT2) @ a
+    # term1_row = jnp.einsum('ik,ik,k->i', Omega, CT2, a)
+    # term1 = term1_row[:, None]
+    term2 = Omega @ gamma @ CS2.T          # Ω γ (C_S^2)^T
+    # term2 = jnp.einsum('ip,pm,mq->iq', Omega, gamma, CS2)          # Ω γ (C_S^2)^T
+    cross = (Omega * C_T) @ gamma @ C_S.T          # C_T γ C_S^T
+    return term1[:,None] + term2 - 2.0 * cross
 
 def build_fgw_cost(alpha, C_feature, C_tree, C_space, a, b, gamma, *args, **kwargs):
     """
@@ -62,7 +64,7 @@ def build_fgw_cost(alpha, C_feature, C_tree, C_space, a, b, gamma, *args, **kwar
     Example (blend): C = (1 - alpha) * C_struct + alpha * C_feat
     """
     L_gw = compute_Lgw(C_tree, C_space, a, b, gamma)
-    return (1.0 - alpha) * C_feature + alpha * L_gw # alpha=0 doesn't seem to give the same result as POT w-ot because of the gamma multiplier of C_feature
+    return (1.0 - alpha) * C_feature + alpha * L_gw
 
 def build_cladefgw_cost(alpha, C_feature, C_tree, C_space, a, b, gamma, omega, Omega, *args, **kwargs):
     """
@@ -73,7 +75,8 @@ def build_cladefgw_cost(alpha, C_feature, C_tree, C_space, a, b, gamma, omega, O
     Omega is a symmetric matrix of size n_cells x n_cells indicating wether two cells belong to the same clade
     """
     L_cladegw = compute_Lcladegw(C_tree, C_space, a, b, gamma, Omega)
-    C = (1 - alpha).dot(omega)*Omega.dot(C_feature) + alpha.dot(omega)*L_cladegw
+    alphas = omega @ alpha
+    C = (1-alphas[:,None])*C_feature + alphas[:,None]*L_cladegw
     return C
 
 def sinkhorn_unrolled(C, a, b, eps, T, uv0=None):
@@ -210,5 +213,70 @@ def learn_alpha_gamma(
 
     alpha_final = jax.nn.sigmoid(beta)
     return float(alpha_final), jnp.array(alpha_hist), jnp.array(loss_hist), gamma_uv[0]
+
+
+def make_step_fn_cladefgw(C_feature, Y, C_tree, C_space, a, b, eps, optimizer, cell_type_assignments, cell_type_signatures, sigma, omega, Omega,T_sinkhorn=50, J_alt=3):
+    def loss_fn(betas, gamma_uv):
+        gamma0, uv0 = gamma_uv
+        alphas = jax.nn.sigmoid(betas)  # α ∈ (0,1)
+
+        # First alternating round uses gamma0 inside C; subsequent rounds are unrolled
+        def one_round(gamma, uv):
+            C = build_cladefgw_cost(alphas, C_feature, C_tree, C_space, a, b, gamma, omega, Omega)
+            return sinkhorn_unrolled(C, a, b, eps, T_sinkhorn, uv)
+
+        # Unroll J_alt rounds with carry
+        def body(carry, _):
+            gamma, uv = carry
+            gamma, uv = one_round(gamma, uv)
+            return (gamma, uv), None
+
+        (gamma_star, uv_star), _ = jax.lax.scan(body, (gamma0, uv0), xs=None, length=J_alt)
+
+        loss = deconvolution_loss(Y, gamma_star, cell_type_assignments, cell_type_signatures, sigma)
+        return loss, ((gamma_star, uv_star), alphas)
+
+    @jax.jit
+    def step(betas, opt_state, gamma_uv):
+        (loss_value, (gamma_uv_new, alphas)), g = jax.value_and_grad(loss_fn, has_aux=True)(betas, gamma_uv)
+        updates, opt_state = optimizer.update(g, opt_state, params=betas)
+        betas = optax.apply_updates(betas, updates)
+        return betas, opt_state, gamma_uv_new, loss_value, alphas
+
+    return step
+
+def learn_alpha_gamma_cladefgw(
+    C_feature, Y, C_tree, C_space, a, b,
+    cell_type_assignments, cell_type_signatures, sigma,
+    omega, Omega,
+    eps=0.05, T_sinkhorn=50, J_alt=3,
+    K_outer=200, lr=1e-2, beta0=0.0,
+    gamma0=None, uv0=None,
+):
+    n = a.shape[0]; m = b.shape[0]
+    if gamma0 is None:
+        # uniform feasible plan as a warm start
+        gamma0 = (a[:, None] * b[None, :])
+    if uv0 is None:
+        uv0 = (jnp.ones_like(a), jnp.ones_like(b))
+
+    optimizer = optax.adam(lr)
+    betas = jnp.array(beta0)
+    opt_state = optimizer.init(betas)
+
+    step = make_step_fn_cladefgw(C_feature, Y, C_tree, C_space, a, b, eps, optimizer, cell_type_assignments, cell_type_signatures, sigma, omega, Omega, T_sinkhorn, J_alt)
+
+    gamma_uv = (gamma0, uv0)
+    loss_hist, alphas_hist = [], []
+
+    with tqdm(range(K_outer)) as pbar:
+        for _ in pbar:
+            betas, opt_state, gamma_uv, loss_value, alphas = step(betas, opt_state, gamma_uv)
+            loss_hist.append(float(loss_value))
+            alphas_hist.append(alphas)
+            pbar.set_postfix({'loss': float(loss_value)})
+
+    alpha_final = jax.nn.sigmoid(betas)
+    return alpha_final, jnp.stack(alphas_hist, axis=1), jnp.array(loss_hist), gamma_uv[0]
 
 
