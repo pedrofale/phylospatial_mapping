@@ -70,10 +70,10 @@ def simulate_spatial_locations(tree_simulator, mode):
     n_samples = 100
 
     modes = {
-        '1': {'2': .1, '3': .1},
-        '2': {'4': .1, '5': .1, '6': .1, '7': .1},
-        '3': {'4': .1, '5': .1, '3': .1},
-        '4': {'1': 1.},
+        'main_clades': {'2': .1, '3': .1},
+        'subclades': {'4': .1, '5': .1, '6': .1, '7': .1},
+        'main_and_subclades': {'4': .1, '5': .1, '3': .1},
+        'unstructured': {'1': 1.},
     }
 
     simulated_tree = tree_simulator.simulate_tree()
@@ -105,7 +105,12 @@ def simulate_spatial_locations(tree_simulator, mode):
     return simulated_tree
 
 
-def simulate_expression(simulated_tree, n_traits, n_genes, alpha=1.0, obs_model='normal', sigma=0.1):
+def simulate_expression(simulated_tree, expression_mode, n_traits, n_genes, obs_model='normal', sigma=0.1):
+    expression_modes = {
+        'tree': {'alpha': 1., 'rates': [.1]*4},
+        'mix': {'alpha': 0.5, 'rates': [.1]*4},
+        'external': {'alpha': 0., 'rates': [.1]*4},
+    }
     # Each row is a gene program (signature), each column is a gene
     # 1 indicates the gene is active in that program, 0 otherwise
     trait_signatures = np.zeros((n_traits, n_genes))
@@ -129,13 +134,20 @@ def simulate_expression(simulated_tree, n_traits, n_genes, alpha=1.0, obs_model=
 
     trait_covariances = pd.DataFrame(trait_covariances, index=["T" + str(i) for i in range(n_traits)], columns=["T" + str(i) for i in range(n_traits)])
     spatial_activation = visium_simulator.prior(200, visium_simulator.circ_equation, decay_factor=.001, radius=50, center_x=100, center_y=100)
-    gene_program = np.zeros((n_genes,))
-    gene_program[np.random.choice(n_genes, size=5)] = 1. # activate these genes
+    spatial_gene_program = np.zeros((n_genes,))
+    spatial_gene_program[np.random.choice(n_genes, size=5)] = 1. # activate these genes
 
-    ex_simulator = expression_simulator.ExpressionSimulator(trait_covariances, trait_signatures, spatial_activation, gene_program)
-    ex_simulator.overlay_data(simulated_tree, alpha=alpha) # 0: fully external factors, 1: fully tree
+    subclades = []
+    for subclade in ['4', '5', '6', '7']:
+        subclade_leaves = simulated_tree.leaves_in_subtree(subclade)
+        subclades.append(subclade_leaves)
+    rates = expression_modes[expression_mode]['rates']
+    
+    ex_simulator = expression_simulator.ExpressionSimulator(trait_covariances, trait_signatures, spatial_activation, spatial_gene_program)
+    ex_simulator.overlay_data(simulated_tree, alpha=expression_modes[expression_mode]['alpha'], clades=subclades, rates=rates) # 0: fully external factors, 1: fully tree
     expression = simulated_tree.cell_meta[[f'G{i}' for i in range(ex_simulator.n_genes)]].loc[ex_simulator.leaf_names]#.to_numpy()
     trait_activations = simulated_tree.cell_meta[[f'T{i}' for i in range(ex_simulator.n_traits)]].loc[ex_simulator.leaf_names]
+    spatial_activations = simulated_tree.cell_meta[ex_simulator.spatial_activation_name].loc[ex_simulator.leaf_names]
 
     # Simulate single-cell gene expression data
     if obs_model == 'normal':
@@ -154,7 +166,8 @@ def simulate_expression(simulated_tree, n_traits, n_genes, alpha=1.0, obs_model=
     ss_simulated_adata.obsm['trait_activations'] = trait_activations
     for trait in ex_simulator.trait_names:
         ss_simulated_adata.obs[trait] = trait_activations[trait]        
-    
+    ss_simulated_adata.obs['spatial_activations'] = spatial_activations
+
     ss_simulated_adata.obs['library_id'] = 'simulated_puck'            
     ss_simulated_adata.obsm['spatial'] = simulated_tree.cell_meta[['spatial_0', 'spatial_1']].loc[expression.index].to_numpy()
 
@@ -201,6 +214,7 @@ def simulate_visium(ss_simulated_adata, obs_model='normal', sigma=0.1):
     n_spots = spots.shape[0]
     spot_expression = np.zeros((n_spots, n_genes))
     spot_trait_activations = np.zeros((n_spots, n_traits))
+    spot_spatial_activations = np.zeros((n_spots, 1))
     spot_names = [f'spot_{i}' for i in range(n_spots)]
     cells_in_spots = []
     clades_fractions = []
@@ -210,6 +224,7 @@ def simulate_visium(ss_simulated_adata, obs_model='normal', sigma=0.1):
         spot_cells = np.where(cells_to_spots == f'spot_{spot}')[0]
         spot_expression[spot] = np.mean(ss_simulated_adata.X[spot_cells], axis=0) # all transcripts
         spot_trait_activations[spot] = np.mean(ss_simulated_adata.obsm['trait_activations'].iloc[spot_cells], axis=0) # all traits
+        spot_spatial_activations[spot] = np.mean(ss_simulated_adata.obs['spatial_activations'].iloc[spot_cells], axis=0) # all spatial activations
         cells_in_spots.append(len(spot_cells))
         # Ensure clade_counts contains all possible clade_level2 values, fill missing with 0
         clade_counts = ss_simulated_adata.obs.iloc[spot_cells]['clade_level2'].value_counts()
@@ -237,19 +252,21 @@ def simulate_visium(ss_simulated_adata, obs_model='normal', sigma=0.1):
     for trait in spot_trait_activations.columns:
         spatial_simulated_adata.obs[trait] = spot_trait_activations[trait]
 
+    spatial_simulated_adata.obs["spatial_activations"] = spot_spatial_activations
+
     # Sort spots per clade
     spatial_simulated_adata = spatial_simulated_adata[spatial_simulated_adata.obs['clade_level2'].sort_values().index]
     return spatial_simulated_adata
 
-def simulate_data(mode, n_cells=512, n_genes=10, n_traits=5, expression_alpha=1.0, obs_model='normal', sigma=0.1, seed=42):
+def simulate_data(spatial_mode, expression_mode, n_cells=512, n_genes=10, n_traits=5, obs_model='normal', sigma=0.1, seed=42):
     np.random.seed(seed)
     tree_simulator = cas.sim.CompleteBinarySimulator(num_cells=n_cells)
 
     # Simulate spatial locations
-    simulated_tree = simulate_spatial_locations(tree_simulator, mode)
+    simulated_tree = simulate_spatial_locations(tree_simulator, spatial_mode)
     
     # Simulate expression
-    ss_simulated_adata = simulate_expression(simulated_tree, n_traits, n_genes, alpha=expression_alpha, obs_model=obs_model, sigma=sigma)
+    ss_simulated_adata = simulate_expression(simulated_tree, expression_mode, n_traits, n_genes, obs_model=obs_model, sigma=sigma)
 
     # Simulate spatial gene expression data
     spatial_simulated_adata = simulate_visium(ss_simulated_adata, obs_model=obs_model, sigma=sigma)

@@ -51,6 +51,7 @@ class ExpressionSimulator(DataSimulator):
         self.n_genes = trait_signatures.shape[1]
         self.trait_names = ["T" + str(i) for i in range(self.n_traits)]
         self.gene_names = ["G" + str(i) for i in range(self.n_genes)]
+        self.spatial_activation_name = 'spatial_activations'
         
     def make_leaf_cov_matrix(self, phylotree):
         # Create covariance matrix for species from tree 
@@ -200,19 +201,22 @@ class ExpressionSimulator(DataSimulator):
     def sample_spatial_effects(self, tree):
         # For each cell, check where in the grid it is
         leaf_spatial_effects = pd.DataFrame(index=self.leaf_names, columns=self.gene_names)
+        spatial_activations = pd.DataFrame(index=self.leaf_names, columns=[self.spatial_activation_name])
         for leaf in self.leaf_names:
             x, y = tree.cell_meta.loc[leaf, ['spatial_0', 'spatial_1']]
             x = int(x * (self.spatial_map.shape[0] - 1))
             y = int(y * (self.spatial_map.shape[1] - 1))
             leaf_spatial_effects.loc[leaf] = self.spatial_map[x, y] * self.spatial_program
-        return leaf_spatial_effects 
+            spatial_activations.loc[leaf, self.spatial_activation_name] = self.spatial_map[x, y]
+        return leaf_spatial_effects, spatial_activations
 
     def sample_combined_expression(self, tree, alpha=0.5, clades=None, rates=None):
         brownian_motion_activations = self.sample_brownian_motion(clades=clades, rates=rates)
         brownian_motion_proportions = np.exp(brownian_motion_activations) / np.sum(np.exp(brownian_motion_activations), axis=1).values[:, None]
         brownian_motion_expression = brownian_motion_proportions.dot(self.trait_signatures)
-        expression = alpha*brownian_motion_expression + (1-alpha)*self.sample_spatial_effects(tree)
-        return expression, brownian_motion_proportions
+        spatial_expression, spatial_activations = self.sample_spatial_effects(tree)
+        expression = alpha*brownian_motion_expression + (1-alpha)*spatial_expression
+        return expression, brownian_motion_proportions, spatial_activations
 
     def overlay_data(
         self,
@@ -236,8 +240,8 @@ class ExpressionSimulator(DataSimulator):
         if not hasattr(self, 'leaf_cov_matrix'):
             phylotree = ete3.Tree(tree.get_newick())
             self.make_leaf_cov_matrix(phylotree)
-        expression, brownian_motion_activations = self.sample_combined_expression(tree, alpha=alpha, clades=clades, rates=rates)
-
+        expression, brownian_motion_activations, spatial_activations = self.sample_combined_expression(tree, alpha=alpha, clades=clades, rates=rates)
+        
         # Set cell meta
         cell_meta = (
             tree.cell_meta.copy()
@@ -254,5 +258,10 @@ class ExpressionSimulator(DataSimulator):
         cell_meta[columns] = np.nan
         for leaf in tree.leaves:
             cell_meta.loc[leaf, columns] = brownian_motion_activations.loc[leaf]
+
+        columns = [self.spatial_activation_name]
+        cell_meta[columns] = np.nan
+        for leaf in tree.leaves:
+            cell_meta.loc[leaf, columns] = spatial_activations.loc[leaf]
 
         tree.cell_meta = cell_meta
