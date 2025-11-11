@@ -7,7 +7,7 @@ import anndata
 import pandas as pd
 from scipy.spatial.distance import pdist, squareform
 from scipy.stats import pearsonr
-
+import pycea as py
 
 # Try relative import first (for package imports), fall back to absolute import (for direct imports)
 try:
@@ -395,3 +395,71 @@ def structural_concordance(C_T, C_S, gamma, eps=1e-12):
     # 6) map to [0,1]
     score = 0.5 * (corr + 1.0)
     return score
+
+def compute_rmse(true_scores, inferred_scores):
+    return np.sqrt(np.mean((true_scores - inferred_scores)**2))
+
+
+def annotate_clades(tdata_slice, max_depth=4, min_cells=30):
+    lcas = py.tl.clades(tdata_slice, depth=4, depth_key="time", update=False, copy=True)
+    lcas.set_index("node", inplace=True)
+    # Create dict mapping nodes to clades, relabeling clades with <100 cells as 'NA'
+    clade_counts = tdata_slice.obs["clade"].value_counts()
+    node_to_clade = {}
+    for node, clade in lcas["clade"].items():
+        clade_str = str(clade)
+        if clade_counts.get(clade_str, 0) < min_cells:
+            node_to_clade[node] = "NA"
+        else:
+            node_to_clade[node] = clade_str
+
+    # Find all unique non-NA clade labels and map them to new indices starting from 0
+    non_na_clades = sorted({clade for clade in node_to_clade.values() if clade != "NA"})
+    clade_reindex = {old: str(idx) for idx, old in enumerate(non_na_clades)}
+
+    # Now, build reindexed node_to_clade
+    node_to_clade_reindexed = {}
+    for node, clade in node_to_clade.items():
+        if clade == "NA":
+            node_to_clade_reindexed[node] = "NA"
+        else:
+            node_to_clade_reindexed[node] = clade_reindex[clade]
+
+    relabeled_lca = py.tl.clades(tdata_slice, clades=node_to_clade_reindexed, depth_key="time", update=False, copy=True, key_added=f"clade_depth{max_depth}")
+    NA_nodes = relabeled_lca.loc[relabeled_lca[f"clade_depth{max_depth}"] == "NA"]["node"].values
+
+    clade_palette = py.get.palette(tdata_slice, key="clade_depth4", cmap="rainbow")
+    clade_palette['NA'] = 'lightgray'
+    py.pl.tree(tdata_slice, depth_key="time", branch_color="clade_depth4", palette=clade_palette, legend=True)
+
+    # And now go for 1 - (max_depth-1)
+    for depth in range(0, max_depth):
+        lcas = py.tl.clades(tdata_slice, depth=depth, depth_key="time", update=False, copy=True)
+        lcas.set_index("node", inplace=True)
+        # Create dict mapping nodes to clades, relabeling clades with <100 cells as 'NA'
+        clade_counts = tdata_slice.obs["clade"].value_counts()
+        node_to_clade = {}
+        for node, clade in lcas["clade"].items():
+            clade_str = str(clade)
+            if clade_counts.get(clade_str, 0) < min_cells or clade_str in NA_nodes:
+                node_to_clade[node] = "NA"
+            else:
+                node_to_clade[node] = clade_str
+
+        # Find all unique non-NA clade labels and map them to new indices starting from 0
+        non_na_clades = sorted({clade for clade in node_to_clade.values() if clade != "NA"})
+        clade_reindex = {old: str(idx) for idx, old in enumerate(non_na_clades)}
+
+        # Now, build reindexed node_to_clade
+        node_to_clade_reindexed = {}
+        for node, clade in node_to_clade.items():
+            if clade == "NA":
+                node_to_clade_reindexed[node] = "NA"
+            else:
+                node_to_clade_reindexed[node] = clade_reindex[clade]
+
+        relabeled_lca = py.tl.clades(tdata_slice, clades=node_to_clade_reindexed, depth_key="time", update=False, copy=True, key_added=f"clade_depth{depth}")
+        
+        clade_palette = py.get.palette(tdata_slice, key=f"clade_depth{depth}", cmap="rainbow")
+        clade_palette['NA'] = 'lightgray'
+        py.pl.tree(tdata_slice, depth_key="time", branch_color=f"clade_depth{depth}", palette=clade_palette, legend=True);
