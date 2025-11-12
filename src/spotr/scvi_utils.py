@@ -1,9 +1,3 @@
-# import matplotlib.pyplot as plt
-# import numpy as np
-# import scanpy as sc
-# import scvi
-# import seaborn as sns
-import torch
 from scvi.model import CondSCVI, DestVI
 
 
@@ -17,4 +11,4 @@ def fit_stLVM(st_adata, sc_model):
     DestVI.setup_anndata(st_adata, layer="counts")
     st_model = DestVI.from_rna_model(st_adata, sc_model)
     st_model.train(max_epochs=2500)
-    return st_model.get_proportions()
+    return st_model
