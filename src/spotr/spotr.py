@@ -11,13 +11,23 @@ def alpha_penalty(alpha, mF, mL, tau=1e-2, lam=1e-2):
     phi = jax.lax.stop_gradient(jnp.maximum((tau - S) / tau, 0.0))
     return lam * (alpha**2) * phi
 
-def deconvolution_loss(Y, gamma, cell_type_assignments, cell_type_signatures, sigma):
+def _deconvolution_loss(Y, gamma, cell_type_assignments, cell_type_signatures, sigma):
     """
     Outer loss: scalar function of the transport plan gamma [n, m].
     """
     spot_cell_type_proportions = jnp.einsum('ji,ik->jk', gamma.T * gamma.shape[1], cell_type_assignments)
     spot_mean = jnp.einsum('jk,kg->jg', spot_cell_type_proportions, cell_type_signatures)
     return -tfp.distributions.Normal(spot_mean, sigma).log_prob(Y).sum()
+
+def deconvolution_loss(Y, spot_scales, gamma, cell_type_assignments, cell_type_signatures):
+    """
+    Outer loss: scalar function of the transport plan gamma [n, m].
+    """
+    spot_cell_type_proportions = jnp.einsum('ji,ik->jk', gamma.T * gamma.shape[1], cell_type_assignments)
+    spot_mean = jnp.einsum('jk,kg->jg', spot_cell_type_proportions, cell_type_signatures)
+    ll = tfp.distributions.Poisson(spot_mean * spot_scales).log_prob(Y).sum()    
+    lp = tfp.distributions.Gamma(1., 1.).log_prob(spot_scales).sum()
+    return -(ll + lp) # loss
 
 @jax.jit
 def compute_Lgw(C_T, C_S, a, b, gamma):
@@ -99,9 +109,13 @@ def dc(M, a, b):
     return M
 
 def mad_abs(M, eps=1e-12):
-    return jnp.median(jnp.abs(M)) + eps
+    return jnp.median(jnp.abs(M))# + eps
 
-def build_fgw_cost(alpha, C_feature, C_tree, C_space, a, b, gamma, sF_ref, sL_ref, zero_thresh=1e-6, *args, **kwargs):
+# def mad_abs(x, axis=None, eps=1e-12):
+#     q50 = jax.lax.quantile(jnp.abs(x), 0.5, axis=axis, interpolation='nearest')
+    # return jnp.clip(q50, eps, 1e12)
+
+def build_fgw_cost(alpha, C_feature, C_tree, C_space, a, b, gamma, sF_ref, sL_ref, alpha_ref=0.5, zero_thresh=1e-6, *args, **kwargs):
     """
     Return the FGW cost matrix C(alpha) with shape [n, m].
     Example (blend): C = (1 - alpha) * C_struct + alpha * C_feat
@@ -114,12 +128,11 @@ def build_fgw_cost(alpha, C_feature, C_tree, C_space, a, b, gamma, sF_ref, sL_re
     mL = jnp.clip(jax.lax.stop_gradient(sL_ref), 1e-6, 1e6)
     mF = jnp.clip(jax.lax.stop_gradient(sF_ref), 1e-6, 1e6)
     # 3) detect “no structure” relative to features
-    no_struct = (mL < .01 * mF)
+    no_struct = (mL < .001 * mF)
 
     # 4) normalize and mix (if no_struct → drop L̂)
     F_hat = F_c / mF
     L_hat = jnp.where(no_struct, 0.0, L_c / mL)
-    # L_c = L_c*0
     C = (1-alpha) * F_hat + alpha * L_hat
     Z = jnp.median(jnp.abs(F_hat)) + jnp.median(jnp.abs(L_hat))
     den = ((1-alpha)*jnp.median(jnp.abs(F_hat)) + alpha*jnp.median(jnp.abs(L_hat)))
@@ -128,8 +141,6 @@ def build_fgw_cost(alpha, C_feature, C_tree, C_space, a, b, gamma, sF_ref, sL_re
     s = jax.lax.stop_gradient(s)    
     C = C * s
     return C
-
-import jax.numpy as jnp
 
 def _dc_rect(M, a, b):
     # double-centering for n×m with weights a (rows), b (cols)
@@ -145,52 +156,73 @@ def _dc_square(M, w):
     mu = jnp.dot(w, r)
     return M - r[:, None] - c[None, :] + mu
 
+
 def preprocess_costs(
     C_feature, C_tree, C_space, a, b,
-    mode: str = "per_matrix",   # "per_matrix" or "gw_balanced"
-    eps: float = 1e-6
+    *,
+    gw_balance=True,          # step 3: balance CT/CS for L pieces
+    match_L_to_F=True,        # step 4: make median(|L|) ~= median(|F|) at gamma_ref
+    gamma_ref=None,           # if None uses a b^T
+    eps=1e-6
 ):
     """
     Returns:
-      C_feat_sc, C_tree_sc, C_space_sc, info (dict of scales)
-    Modes:
-      - "per_matrix": DC each matrix, scale by median(|.|) of its DC.
-      - "gw_balanced": same, then calibrate C_tree/C_space so the GW linearization
-        terms have comparable magnitude (using gamma_ref = a b^T).
+      C_feat_sc, C_tree_sc, C_space_sc, info
+    Scales are computed once (outside gradients) and should be treated as constants downstream.
     """
-    # 1) DC each matrix
-    F_dc = _dc_rect(C_feature, a, b)        # [n,m]
-    T_dc = _dc_square(C_tree, a)            # [n,n]
-    S_dc = _dc_square(C_space, b)           # [m,m]
+    # ---- 1) Double-center each input w.r.t. (a,b) ----
+    F_dc = _dc_rect(C_feature, a, b)   # [n,m]
+    T_dc = _dc_square(C_tree,  a)      # [n,n]
+    S_dc = _dc_square(C_space, b)      # [m,m]
 
-    # 2) robust per-matrix scales
+    # ---- 2) Robust per-matrix scales (post-DC) ----
     sF = jnp.clip(jnp.median(jnp.abs(F_dc)), eps, 1e12)
     sT = jnp.clip(jnp.median(jnp.abs(T_dc)), eps, 1e12)
     sS = jnp.clip(jnp.median(jnp.abs(S_dc)), eps, 1e12)
 
-    # 3) normalize originals (so later L uses these rescaled inputs)
+    # Normalize originals so later computations use these rescaled inputs
     C_feat_sc = C_feature / sF
     C_tree_sc = C_tree   / sT
     C_space_sc= C_space  / sS
 
     info = {"sF_dc": sF, "sT_dc": sT, "sS_dc": sS}
 
-    if mode == "gw_balanced":
-        # Calibrate structural parts for L: (CT^2 a), (CS^2 b), (CT γ CS^T)
-        gamma_ref = a[:, None] * b[None, :]   # simple, stable reference
-        CT = C_tree_sc
-        CS = C_space_sc
-        mT2 = jnp.clip(jnp.median(jnp.abs((CT*CT) @ a)), eps, 1e12)
-        mS2 = jnp.clip(jnp.median(jnp.abs((CS*CS) @ b)), eps, 1e12)
-        mTS = jnp.clip(jnp.median(jnp.abs(CT @ gamma_ref @ CS.T)), eps, 1e12)
+    # Reference coupling for GW calibration
+    if gamma_ref is None:
+        gamma_ref = a[:, None] * b[None, :]
 
+    # ---- 3) (optional) GW-balance CT/CS so L pieces have comparable scale ----
+    if gw_balance:
+        CT, CS = C_tree_sc, C_space_sc
+        mT2 = jnp.clip(jnp.median(jnp.abs((CT * CT) @ a)), eps, 1e12)
+        mS2 = jnp.clip(jnp.median(jnp.abs((CS * CS) @ b)), eps, 1e12)
+        mTS = jnp.clip(jnp.median(jnp.abs(CT @ gamma_ref @ CS.T)), eps, 1e12)
         cT  = jnp.sqrt(mTS / mT2)
         cS  = jnp.sqrt(mTS / mS2)
-
         C_tree_sc  = CT * cT
         C_space_sc = CS * cS
-
         info.update({"cT": cT, "cS": cS, "mT2": mT2, "mS2": mS2, "mTS": mTS})
+
+    # ---- 4) (optional) Match median(|L|) to median(|F|) at gamma_ref ----
+    if match_L_to_F:
+        # Build GW linearization L at gamma_ref with current (balanced) CT/CS
+        def _dc_rect_outer(M, a, b):  # DC for n×m (same as F_dc)
+            r = M @ b; c = M.T @ a; mu = jnp.dot(a, r)
+            return M - r[:, None] - c[None, :] + mu
+
+        # L = (CT^2 a) 1^T + 1 (CS^2 b)^T - 2 CT gamma_ref CS^T
+        CT, CS = C_tree_sc, C_space_sc
+        L_ref = ( (CT * CT) @ a )[:, None] + ( (CS * CS) @ b )[None, :] \
+                - 2.0 * (CT @ gamma_ref @ CS.T)
+        L_ref_dc = _dc_rect_outer(L_ref, a, b)
+        mF = jnp.clip(jnp.median(jnp.abs(_dc_rect(C_feat_sc, a, b))), eps, 1e12)
+        mL = jnp.clip(jnp.median(jnp.abs(L_ref_dc)), eps, 1e12)
+
+        # Scale CT, CS together so median(|L|) ≈ median(|F|)
+        lam = jnp.sqrt(mF / mL)
+        C_tree_sc  = C_tree_sc  * lam
+        C_space_sc = C_space_sc * lam
+        info.update({"lam_match_L_to_F": lam, "mF_ref": mF, "mL_ref": mL})
 
     return C_feat_sc, C_tree_sc, C_space_sc, info
 
@@ -205,7 +237,7 @@ def build_cladefgw_cost(
     sF_ref, sL_ref,        # [K] per-clade reference scales (fixed/EMA); no grad inside
     # --- stability knobs ---
     alpha_ref=None,        # [K] optional fixed/EMA reference alphas for equalizer (no grad); if None uses 0.5
-    zero_rel=1e-1,
+    zero_rel=1e-10,
     s_min=1e-6, s_max=1e6,
     s_lo=5e-1, s_hi=2.0,
     rel_mid=1e-2, ksharp=6.0,
@@ -220,7 +252,7 @@ def build_cladefgw_cost(
     n, m = C_feature.shape
 
     # 1) centered parts
-    F_c = dc(C_feature, a, b)  # [n,m]
+    F_c = _dc_rect(C_feature, a, b)  # [n,m]
     L_c = perclade_dc_L(compute_Lcladegw(C_tree, C_space, a, b, gamma, Omega), a, b, omega)  # [n,m]
 
     # 2) per-clade base scales -> rows (stop-grad)
@@ -273,44 +305,11 @@ def build_cladefgw_cost(
     return C
 
 
-
-def sinkhorn_unrolled(C, a, b, eps, T, uv0=None):
-    """
-    C:  [n, m]
-    a:  [n]  (sum=1)
-    b:  [m]  (sum=1)
-    eps: float
-    T:   int (iterations)
-    uv0: optional warm-start tuple (u0, v0)
-
-    Returns: (gamma, (u, v)) with shapes [n, m], [n], [m]
-    """
-    K = jnp.exp(-C / eps)  # [n, m]
-
-    if uv0 is None:
-        # normalized ones is usually fine
-        u0 = jnp.ones_like(a)
-        v0 = jnp.ones_like(b)
-    else:
-        u0, v0 = uv0
-
-    def body(_, carry):
-        u, v = carry
-        Kv = K @ v + 1e-12
-        u = a / Kv
-        KTu = K.T @ u + 1e-12
-        v = b / KTu
-        return (u, v)
-
-    u, v = jax.lax.fori_loop(0, T, body, (u0, v0))
-    gamma = (u[:, None]) * K * (v[None, :])  # diag(u) @ K @ diag(v)
-    return gamma, (u, v)
-
 # Safe real-domain Sinkhorn (keeps gradients)
 def exp_smooth_clipped(x, M=60.0):
     return jnp.exp(M * jnp.tanh(x / M))
 
-def sinkhorn_unrolled_safe(C, a, b, eps, T, uv0=None, tiny=1e-300, M=60.0):
+def sinkhorn_unrolled_safe(C, a, b, eps, T, uv0=None, tiny=1e-300, M=40.0):
     K = exp_smooth_clipped(-C/eps, M=M) + tiny
     u = jnp.ones_like(a) if uv0 is None else jnp.maximum(uv0[0], tiny)
     v = jnp.ones_like(b) if uv0 is None else jnp.maximum(uv0[1], tiny)
@@ -359,7 +358,7 @@ def sinkhorn_cladefgw(C_feature, C_tree, C_space, a, b, eps, omega, Omega, T_sin
     if uv0 is None:
         uv0 = (jnp.ones_like(a), jnp.ones_like(b))
 
-    F_c = dc(C_feature, a, b)                              # [n,m]
+    F_c = _dc_rect(C_feature, a, b)                              # [n,m]
     L_c_ref = perclade_dc_L(compute_Lcladegw(C_tree, C_space, a, b, gamma0, Omega), a, b, omega)
     
     # Row-wise robust magnitudes
@@ -400,7 +399,7 @@ def make_step_fn_fgw(C_feature, Y, C_tree, C_space, a, b, eps, optimizer, cell_t
     def loss_fn(beta, gamma_uv):
         gamma0, uv0 = gamma_uv
         alpha = jax.nn.sigmoid(beta)  # α ∈ (0,1)        
-        alpha = jnp.clip(alpha, 0.0, 0.95)   # gradients are 0 when saturated
+        # alpha = jnp.clip(alpha, 0.0, 0.95)   # gradients are 0 when saturated
 
         # First alternating round uses gamma0 inside C; subsequent rounds are unrolled
         def one_round(gamma, uv):
@@ -415,9 +414,8 @@ def make_step_fn_fgw(C_feature, Y, C_tree, C_space, a, b, eps, optimizer, cell_t
             return (gamma, uv), None
 
         (gamma_star, uv_star), _ = jax.lax.scan(body, (gamma0, uv0), xs=None, length=J_alt)
-
+        
         loss = deconvolution_loss(Y, gamma_star, cell_type_assignments, cell_type_signatures, sigma)
-        loss += alpha_penalty(alpha, sF_ref, sL_ref)
         return loss, ((gamma_star, uv_star), alpha)
 
     @jax.jit
@@ -453,7 +451,7 @@ def learn_alpha_gamma_fgw(
     opt_state = optimizer.init(beta)
 
     step = make_step_fn_fgw(C_feature, Y, C_tree, C_space, a, b, eps, optimizer, cell_type_assignments, cell_type_signatures, sigma, sF_ref, sL_ref, T_sinkhorn, J_alt)
-
+    print(f"Starting optimization with beta0={beta0}")
     gamma_uv = (gamma0, uv0)
     loss_hist, alpha_hist = [], []
     gamma_hist = []
@@ -472,7 +470,7 @@ def logit(x, eps=1e-6):
     x = jnp.clip(x, eps, 1 - eps)
     return jnp.log(x) - jnp.log1p(-x)
 
-def make_step_fn_cladefgw(C_feature, Y, C_tree, C_space, a, b, eps, optimizer, cell_type_assignments, cell_type_signatures, sigma, omega, Omega, sF_ref, sL_ref, T_sinkhorn=50, J_alt=3, train_mask=None, alpha_init=None):
+def make_step_fn_cladefgw(C_feature, Y, C_tree, C_space, a, b, eps, optimizer, cell_type_assignments, cell_type_signatures, omega, Omega, sF_ref, sL_ref, T_sinkhorn=50, J_alt=3, train_mask=None, alpha_init=None):
     if train_mask is None:
         # default: train all
         # infer K from omega
@@ -481,8 +479,10 @@ def make_step_fn_cladefgw(C_feature, Y, C_tree, C_space, a, b, eps, optimizer, c
     if alpha_init is None:
         alpha_init = jnp.full((K,), 0.5)
 
-    def loss_fn(betas, gamma_uv):
+    def loss_fn(params, gamma_uv):
         gamma0, uv0 = gamma_uv
+        betas = params['betas']
+        spot_scales = jax.nn.softplus(params['s_raw']) + 1e-6 # ensure positive
         alphas = jax.nn.sigmoid(betas)  # α ∈ (0,1)
         alphas = jnp.clip(alphas, 0.0, 0.95)   # gradients are 0 when saturated
         alphas = jnp.where(train_mask > 0.5, alphas, jax.lax.stop_gradient(alpha_init))
@@ -500,28 +500,167 @@ def make_step_fn_cladefgw(C_feature, Y, C_tree, C_space, a, b, eps, optimizer, c
 
         (gamma_star, uv_star), _ = jax.lax.scan(body, (gamma0, uv0), xs=None, length=J_alt)
 
-        loss = deconvolution_loss(Y, gamma_star, cell_type_assignments, cell_type_signatures, sigma)
-        return loss, ((gamma_star, uv_star), alphas)
+        loss = deconvolution_loss(Y, spot_scales, gamma_star, cell_type_assignments, cell_type_signatures)
+        return loss, ((gamma_star, uv_star), alphas, spot_scales)
 
     @jax.jit
-    def step(betas, opt_state, gamma_uv):
-        (loss_value, (gamma_uv_new, alphas)), g = jax.value_and_grad(loss_fn, has_aux=True)(betas, gamma_uv)
+    def step(params, opt_state, gamma_uv):
+        (loss_value, (gamma_uv_new, alphas, spot_scales)), g = jax.value_and_grad(loss_fn, has_aux=True)(params, gamma_uv)
         # zero gradients on fixed alphas
-        g = g * train_mask
-        updates, opt_state = optimizer.update(g, opt_state, params=betas)
+        g['betas'] = g['betas'] * train_mask
+        updates, opt_state = optimizer.update(g, opt_state, params=params)
         # also zero updates on fixed alphas (belt & suspenders)
-        updates = updates * train_mask        
-        betas = optax.apply_updates(betas, updates)
-        return betas, opt_state, gamma_uv_new, loss_value, alphas
+        updates['betas'] = updates['betas'] * train_mask        
+        params = optax.apply_updates(params, updates)
+        return params, opt_state, gamma_uv_new, loss_value, alphas, spot_scales
+
+    return step
+
+
+def make_step_fn_cladefgw_proximal(C_feature, Y, C_tree, C_space, a, b, eps, optimizer, cell_type_assignments, cell_type_signatures, omega, Omega, sF_ref, sL_ref, 
+                                    T_sinkhorn=50, J_alt=3, train_mask=None, alpha_init=None, tau=5.0, learn_scales=True):
+    if train_mask is None:
+        # default: train all
+        # infer K from omega
+        K = omega.shape[1]
+        train_mask = jnp.ones((K,), dtype=jnp.float32)
+    if alpha_init is None:
+        alpha_init = jnp.full((K,), 0.5)
+
+    if learn_scales:
+        s_raw_mask = jnp.ones((Y.shape[0],1))
+    else:
+        s_raw_mask = jnp.zeros((Y.shape[0],1))
+
+    def loss_fn(params, gamma_uv, gamma_ref):
+        gamma0, uv0 = gamma_uv
+        betas = params['betas']
+        spot_scales = jax.nn.softplus(params['s_raw']) + 1e-6 # ensure positive
+        alphas = jax.nn.sigmoid(betas)  # α ∈ (0,1)
+        alphas = jnp.clip(alphas, 0.0, 0.95)   # gradients are 0 when saturated
+        alphas = jnp.where(train_mask > 0.5, alphas, jax.lax.stop_gradient(alpha_init))
+
+        # First alternating round uses gamma0 inside C; subsequent rounds are unrolled
+        def one_round(gamma, uv):
+            C = build_cladefgw_cost(alphas, C_feature, C_tree, C_space, a, b, gamma, omega, Omega, sF_ref, sL_ref)
+            return sinkhorn_unrolled_safe(C, a, b, eps, T_sinkhorn, uv)
+
+        # Unroll J_alt rounds with carry
+        def body(carry, _):
+            gamma, uv = carry
+            gamma, uv = one_round(gamma, uv)
+            return (gamma, uv), None
+
+        (gamma_star, uv_star), _ = jax.lax.scan(body, (gamma0, uv0), xs=None, length=J_alt)
+
+        data_loss = deconvolution_loss(Y, spot_scales, gamma_star, cell_type_assignments, cell_type_signatures)
+        kl_loss = tau * gamma_skl(gamma_star, gamma_ref)
+        loss = data_loss + kl_loss
+        return loss, ((gamma_star, uv_star), alphas, spot_scales, kl_loss)
+
+    @jax.jit
+    def step(params, opt_state, gamma_uv, gamma_ref):
+        (loss_value, (gamma_uv_new, alphas, spot_scales, kl_loss)), g = jax.value_and_grad(loss_fn, has_aux=True)(params, gamma_uv, gamma_ref)
+        # zero gradients on fixed alphas
+        g['betas'] = g['betas'] * train_mask
+        g['s_raw'] = g['s_raw'] * s_raw_mask
+        updates, opt_state = optimizer.update(g, opt_state, params=params)
+        # also zero updates on fixed alphas (belt & suspenders)
+        updates['betas'] = updates['betas'] * train_mask        
+        updates['s_raw'] = updates['s_raw'] * s_raw_mask
+        params = optax.apply_updates(params, updates)
+        return params, opt_state, gamma_uv_new, loss_value, alphas, spot_scales, kl_loss
 
     return step
 
 def row_mad_abs(X):                     # [n,m] -> [n]
     return jnp.median(jnp.abs(X), axis=1) + 1e-12
 
+def softplus_inv(x):
+    return x + jnp.log(-jnp.expm1(-x))
+
+def learn_alpha_gamma_cladefgw_proximal(
+    C_feature, Y, C_tree, C_space, a, b,
+    cell_type_assignments, cell_type_signatures,
+    omega, Omega,
+    eps=0.05, T_sinkhorn=50, J_alt=3,
+    K_outer=200, lr=1e-2, alpha_init=None, train_mask=None,
+    gamma0=None, uv0=None,
+    gamma_ref=None,
+    spot_scales=None,
+    tau=5.0,
+):
+    K = omega.shape[1]
+    if alpha_init is None:
+        alpha_init = jnp.full((K,), 0.5)
+
+    if train_mask is None:
+        train_mask = jnp.ones((K,), dtype=jnp.float32)
+
+    n = a.shape[0]; m = b.shape[0]
+    if gamma0 is None:
+        # uniform feasible plan as a warm start
+        gamma0 = (a[:, None] * b[None, :])
+    if uv0 is None:
+        uv0 = (jnp.ones_like(a), jnp.ones_like(b))
+
+    if gamma_ref is None:
+        gamma_ref = gamma0
+
+    F_c = dc(C_feature, a, b)                              # [n,m]
+    L_c_ref = perclade_dc_L(compute_Lcladegw(C_tree, C_space, a, b, gamma0, Omega), a, b, omega)
+    
+    # Row-wise robust magnitudes
+    rF = row_mad_abs(F_c)                                  # [n]
+    rL = row_mad_abs(L_c_ref)                              # [n]
+
+    # Aggregate to clades with omega (one-hot or soft), using weighted mean
+    cnt_k = jnp.maximum(omega.sum(axis=0), 1e-8)           # [K]
+    sF_ref_k = (omega.T @ rF) / cnt_k                      # [K]
+    sL_ref_k = (omega.T @ rL) / cnt_k                      # [K]
+
+    # Clamp
+    smin, smax = (1e-6, 1e6)
+    sF_ref_k = jnp.clip(sF_ref_k, smin, smax)
+    sL_ref_k = jnp.clip(sL_ref_k, smin, smax)
+
+    sF_ref = sF_ref_k
+    sL_ref = sL_ref_k
+
+    optimizer = optax.adam(lr)
+    betas = logit(alpha_init)
+
+    s_raw = jnp.ones((Y.shape[0],1))
+    learn_scales = True
+    if spot_scales is not None:
+        s_raw = softplus_inv(spot_scales)
+        learn_scales = False
+    params = {"betas": betas, "s_raw": s_raw}
+    opt_state = optimizer.init(params)
+
+    step = make_step_fn_cladefgw_proximal(C_feature, Y, C_tree, C_space, a, b, eps, optimizer, cell_type_assignments, cell_type_signatures, omega, Omega, sF_ref, sL_ref, T_sinkhorn, J_alt, train_mask, alpha_init, learn_scales=learn_scales, tau=tau)
+
+    gamma_uv = (gamma0, uv0)
+    loss_hist, alphas_hist, spot_scales_hist, kl_loss_hist = [], [], [], []
+
+    with tqdm(range(K_outer)) as pbar:
+        for _ in pbar:
+            params, opt_state, gamma_uv, loss_value, alphas, spot_scales, kl_loss = step(params, opt_state, gamma_uv, gamma_ref)
+            loss_hist.append(float(loss_value))
+            alphas_hist.append(alphas)
+            spot_scales_hist.append(spot_scales)
+            kl_loss_hist.append(float(kl_loss))
+            pbar.set_postfix({'loss': float(loss_value), 'kl_loss': float(kl_loss)})
+
+    alpha_final = jax.nn.sigmoid(params['betas'])
+    # ensure returned alphas respect fixed ones
+    alpha_final = jnp.where(train_mask > 0.5, alpha_final, alpha_init)
+    return alpha_final, jnp.stack(alphas_hist, axis=1), jnp.array(loss_hist), gamma_uv[0], spot_scales, jnp.stack(spot_scales_hist, axis=1), jnp.array(kl_loss_hist)
+
+
 def learn_alpha_gamma_cladefgw(
     C_feature, Y, C_tree, C_space, a, b,
-    cell_type_assignments, cell_type_signatures, sigma,
+    cell_type_assignments, cell_type_signatures,
     omega, Omega,
     eps=0.05, T_sinkhorn=50, J_alt=3,
     K_outer=200, lr=1e-2, alpha_init=None, train_mask=None,
@@ -563,24 +702,27 @@ def learn_alpha_gamma_cladefgw(
 
     optimizer = optax.adam(lr)
     betas = logit(alpha_init)
-    opt_state = optimizer.init(betas)
+    s_raw = jnp.ones((Y.shape[0],1))
+    params = {"betas": betas, "s_raw": s_raw}
+    opt_state = optimizer.init(params)
 
-    step = make_step_fn_cladefgw(C_feature, Y, C_tree, C_space, a, b, eps, optimizer, cell_type_assignments, cell_type_signatures, sigma, omega, Omega, sF_ref, sL_ref, T_sinkhorn, J_alt, train_mask, alpha_init)
+    step = make_step_fn_cladefgw(C_feature, Y, C_tree, C_space, a, b, eps, optimizer, cell_type_assignments, cell_type_signatures, omega, Omega, sF_ref, sL_ref, T_sinkhorn, J_alt, train_mask, alpha_init)
 
     gamma_uv = (gamma0, uv0)
-    loss_hist, alphas_hist = [], []
+    loss_hist, alphas_hist, spot_scales_hist = [], [], []
 
     with tqdm(range(K_outer)) as pbar:
         for _ in pbar:
-            betas, opt_state, gamma_uv, loss_value, alphas = step(betas, opt_state, gamma_uv)
+            params, opt_state, gamma_uv, loss_value, alphas, spot_scales = step(params, opt_state, gamma_uv)
             loss_hist.append(float(loss_value))
             alphas_hist.append(alphas)
+            spot_scales_hist.append(spot_scales)
             pbar.set_postfix({'loss': float(loss_value)})
 
-    alpha_final = jax.nn.sigmoid(betas)
+    alpha_final = jax.nn.sigmoid(params['betas'])
     # ensure returned alphas respect fixed ones
     alpha_final = jnp.where(train_mask > 0.5, alpha_final, alpha_init)
-    return alpha_final, jnp.stack(alphas_hist, axis=1), jnp.array(loss_hist), gamma_uv[0]
+    return alpha_final, jnp.stack(alphas_hist, axis=1), jnp.array(loss_hist), gamma_uv[0], spot_scales, jnp.stack(spot_scales_hist, axis=1)
 
 
 def prepare_ot_inputs(ss_simulated_adata, spatial_simulated_adata, tree_distance_matrix, spatial_distance_matrix):
@@ -600,55 +742,9 @@ def prepare_ot_inputs(ss_simulated_adata, spatial_simulated_adata, tree_distance
 
     return C_feature, C_tree, C_space, a, b
 
-def run_spotr_single(ss_simulated_adata, spatial_simulated_adata, tree_distance_matrix, spatial_distance_matrix, 
-            cell_type_assignments, cell_type_signatures, clade_column='clade_level2', sigma=0.01,
-            eps=0.01, T_sinkhorn=100, J_alt=20, K_outer=100, lr=1e-2, clade_to_ignore='NA', alpha=0.5):
-    
-    C_feature, C_tree, C_space, a, b = prepare_ot_inputs(ss_simulated_adata, spatial_simulated_adata, tree_distance_matrix, spatial_distance_matrix)
-
-    Y = jnp.asarray(spatial_simulated_adata.X)            
-    n_cells = ss_simulated_adata.shape[0]
-    cell_clades = ss_simulated_adata.obs[clade_column].values
-    n_clades = len(ss_simulated_adata.obs[clade_column].unique()) # includes clades that we shouldn't learn alphas for
-
-    alpha_init = np.full((n_clades,), alpha)
-    train_mask = np.ones((n_clades,), dtype=np.float32) # train all alphas by default
-    deactivated_clades = np.where(cell_clades == clade_to_ignore)[0]
-    train_mask[deactivated_clades] = 0.0
-    alpha_init[deactivated_clades] = 0.0
-    train_mask = jnp.array(train_mask)
-    alpha_init = jnp.array(alpha_init)
-
-    # omega: (n_cells, n_clades), one-hot encoding each cell's clade
-    clade_to_idx = {clade: i for i, clade in enumerate(np.unique(cell_clades))}
-    omega = np.zeros((n_cells, n_clades), dtype=np.float32)
-    for i, clade in enumerate(cell_clades):
-        omega[i, clade_to_idx[clade]] = 1.0
-
-    # Omega is (n_cells, n_cells), 1 if same clade, else 0. Now rescale so within each clade, values are 1/(size of clade).
-    Omega = (omega @ omega.T).astype(np.float32)
-    row_sums = Omega.sum(axis=1, keepdims=True)
-    Omega = Omega / np.maximum(row_sums, 1e-8)
-    Omega = Omega * n_cells
-    omega = jnp.array(omega)
-    Omega = jnp.array(Omega)
-
-    # Initialize with features only OT
-    gamma0, uv0 = sinkhorn_fgw(C_feature, C_tree, C_space, a, b, .01, 
-                                T_sinkhorn=50, J_alt=1, alpha=0., gamma0=None, uv0=None)
-
-    alphas, alphas_hist, loss_hist, coupling = learn_alpha_gamma_cladefgw(C_feature, Y, C_tree, C_space, a, b,
-                                        jnp.array(cell_type_assignments), jnp.array(cell_type_signatures), sigma,
-                                        omega, Omega,
-                                        eps=eps, T_sinkhorn=T_sinkhorn, J_alt=J_alt, 
-                                        K_outer=K_outer, lr=lr, alpha_init=alpha_init, train_mask=train_mask, gamma0=gamma0, uv0=uv0)    
-
-    return alphas, alphas_hist, loss_hist, coupling
-
-
 def run_spotr(ss_simulated_adata, spatial_simulated_adata, tree_distance_matrix, spatial_distance_matrix, 
-            cell_type_assignments, cell_type_signatures, clade_columns=['clade_level0', 'clade_level1', 'clade_level2'], sigma=0.01,
-            eps=0.01, T_sinkhorn=100, J_alt=20, K_outer=100, lr=1e-2, clade_to_ignore='NA', alpha=0.5):
+            cell_type_assignments, cell_type_signatures, clade_columns=['clade_level0', 'clade_level1', 'clade_level2'], gamma_ref=None,
+            eps=0.01, T_sinkhorn=100, J_alt=20, K_outer=100, lr=1e-2, clade_to_ignore='NA', alpha=0.5, tau=5.0, spot_scales_ref=None):
     
     C_feature, C_tree, C_space, a, b = prepare_ot_inputs(ss_simulated_adata, spatial_simulated_adata, tree_distance_matrix, spatial_distance_matrix)
 
@@ -659,9 +755,13 @@ def run_spotr(ss_simulated_adata, spatial_simulated_adata, tree_distance_matrix,
     Y = jnp.asarray(spatial_simulated_adata.X)            
     n_cells = ss_simulated_adata.shape[0]
 
+    given_gamma_ref = gamma_ref is not None
+    given_spot_scales_ref = spot_scales_ref is not None
+    tau_ref = tau
+
     depth_results = {}
     losses = []
-    for clade_column in clade_columns:
+    for i, clade_column in enumerate(clade_columns):
         cell_clades = ss_simulated_adata.obs[clade_column].values
         clades = np.unique(cell_clades)
         n_clades = len(clades) # includes clades that we shouldn't learn alphas for
@@ -678,8 +778,8 @@ def run_spotr(ss_simulated_adata, spatial_simulated_adata, tree_distance_matrix,
         # omega: (n_cells, n_clades), one-hot encoding each cell's clade
         clade_to_idx = {clade: i for i, clade in enumerate(clades)}
         omega = np.zeros((n_cells, n_clades), dtype=np.float32)
-        for i, clade in enumerate(cell_clades):
-            omega[i, clade_to_idx[clade]] = 1.0
+        for c, clade in enumerate(cell_clades):
+            omega[c, clade_to_idx[clade]] = 1.0
 
         # Omega is (n_cells, n_cells), 1 if same clade, else 0. Now rescale so within each clade, values are 1/(size of clade).
         Omega = (omega @ omega.T).astype(np.float32)
@@ -689,20 +789,47 @@ def run_spotr(ss_simulated_adata, spatial_simulated_adata, tree_distance_matrix,
         omega = jnp.array(omega)
         Omega = jnp.array(Omega)
 
-        alphas, alphas_hist, loss_hist, coupling = learn_alpha_gamma_cladefgw(C_feature, Y, C_tree, C_space, a, b,
-                                            jnp.array(cell_type_assignments), jnp.array(cell_type_signatures), sigma,
+        if i == 0 and not given_gamma_ref:
+            tau = 0.0
+        alphas, alphas_hist, loss_hist, coupling, spot_scales, spot_scales_hist, kl_loss_hist = learn_alpha_gamma_cladefgw_proximal(C_feature, Y, C_tree, C_space, a, b,
+                                            jnp.array(cell_type_assignments), jnp.array(cell_type_signatures),
                                             omega, Omega,
                                             eps=eps, T_sinkhorn=T_sinkhorn, J_alt=J_alt, 
-                                            K_outer=K_outer, lr=lr, alpha_init=alpha_init, train_mask=train_mask, gamma0=gamma0, uv0=uv0)    
+                                            K_outer=K_outer, lr=lr, alpha_init=alpha_init, train_mask=train_mask, gamma0=gamma0, uv0=uv0, gamma_ref=gamma_ref, 
+                                            tau=tau, spot_scales=spot_scales_ref)
         losses.append(loss_hist[-1])
 
         depth_results[clade_column] = {
             'alphas': dict(zip(clades, alphas)),
             'alphas_hist': alphas_hist,
             'loss_hist': loss_hist,
-            'coupling': coupling
+            'coupling': coupling,
+            'spot_scales': spot_scales,
+            'spot_scales_hist': spot_scales_hist,
+            'kl_loss_hist': kl_loss_hist
         }
 
+        if i == 0:
+            if not given_gamma_ref:
+                gamma_ref = coupling
+            if not given_spot_scales_ref:
+                spot_scales_ref = spot_scales
+            tau = tau_ref
+            gamma0 = coupling
+            J_alt = 3
+        
     best_coupling_level = clade_columns[np.argmin(losses)]
 
     return best_coupling_level, depth_results
+
+
+def gamma_skl(G, Gref, eps=1e-12):
+    """
+    Symmetric KL between normalized couplings.
+    """
+    P = G / (jnp.sum(G) + eps)
+    Q = Gref / (jnp.sum(Gref) + eps)
+    kl_pq = jnp.sum(P * (jnp.log(P + eps) - jnp.log(Q + eps)))
+    kl_qp = jnp.sum(Q * (jnp.log(Q + eps) - jnp.log(P + eps)))
+    return 0.5 * (kl_pq + kl_qp)
+
