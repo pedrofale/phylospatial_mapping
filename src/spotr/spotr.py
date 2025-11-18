@@ -6,6 +6,30 @@ from tqdm import tqdm
 import numpy as np
 import ot
 
+def coupling_from_binary(Z, a=None, b=None, iters=1000, eps=1e-12):
+    n, m = Z.shape
+    Z = jnp.asarray(Z, dtype=jnp.float32)
+    if a is None:
+        a = jnp.ones((n,), dtype=jnp.float32) / n
+    if b is None:
+        # Case A: derive b from assignments (equal split per row)
+        k = jnp.maximum(Z.sum(axis=1), 1.0)              # [n]
+        G = (Z / k[:, None]) * a[:, None]                # rows sum to a
+        b_out = G.sum(axis=0)
+        return G, a, b_out
+
+    # Case B: project to target b via IPFP on support of Z
+    # start v=ones; scale rows then cols
+    u = jnp.ones((n,), dtype=jnp.float32)
+    v = jnp.ones((m,), dtype=jnp.float32)
+    for _ in range(iters):
+        Zv = Z @ v + eps
+        u = a / Zv
+        ZTu = Z.T @ u + eps
+        v = b / ZTu
+    G = (u[:, None] * Z) * v[None, :]
+    return G, a, b
+
 def alpha_penalty(alpha, mF, mL, tau=1e-2, lam=1e-2):
     S = jnp.clip(mL / jnp.maximum(mF, 1e-12), 0.0, 1e6)
     phi = jax.lax.stop_gradient(jnp.maximum((tau - S) / tau, 0.0))
@@ -517,6 +541,7 @@ def make_step_fn_cladefgw(C_feature, Y, C_tree, C_space, a, b, eps, optimizer, c
     return step
 
 
+
 def make_step_fn_cladefgw_proximal(C_feature, Y, C_tree, C_space, a, b, eps, optimizer, cell_type_assignments, cell_type_signatures, omega, Omega, sF_ref, sL_ref, 
                                     T_sinkhorn=50, J_alt=3, train_mask=None, alpha_init=None, tau=5.0, learn_scales=True):
     if train_mask is None:
@@ -744,7 +769,7 @@ def prepare_ot_inputs(ss_simulated_adata, spatial_simulated_adata, tree_distance
 
 def run_spotr(ss_simulated_adata, spatial_simulated_adata, tree_distance_matrix, spatial_distance_matrix, 
             cell_type_assignments, cell_type_signatures, clade_columns=['clade_level0', 'clade_level1', 'clade_level2'], gamma_ref=None,
-            eps=0.01, T_sinkhorn=100, J_alt=20, K_outer=100, lr=1e-2, clade_to_ignore='NA', alpha=0.5, tau=5.0, spot_scales_ref=None):
+            eps=0.01, T_sinkhorn=100, J_alt=20, K_outer=100, lr=1e-2, clade_to_ignore='NA', alpha=0.5, tau=5.0, spot_scales_ref=None, max_exp_ratio=25.0):
     
     C_feature, C_tree, C_space, a, b = prepare_ot_inputs(ss_simulated_adata, spatial_simulated_adata, tree_distance_matrix, spatial_distance_matrix)
 
@@ -783,11 +808,36 @@ def run_spotr(ss_simulated_adata, spatial_simulated_adata, tree_distance_matrix,
 
         # Omega is (n_cells, n_cells), 1 if same clade, else 0. Now rescale so within each clade, values are 1/(size of clade).
         Omega = (omega @ omega.T).astype(np.float32)
-        row_sums = Omega.sum(axis=1, keepdims=True)
-        Omega = Omega / np.maximum(row_sums, 1e-8)
-        Omega = Omega * n_cells
+        # row_sums = Omega.sum(axis=1, keepdims=True)
+        # Omega = Omega / np.maximum(row_sums, 1e-8)
+        # Omega = Omega * n_cells
         omega = jnp.array(omega)
         Omega = jnp.array(Omega)
+
+        # Set eps based on the initial cost matrix
+        F_c = dc(C_feature, a, b)                              # [n,m]
+        L_c_ref = perclade_dc_L(compute_Lcladegw(C_tree, C_space, a, b, gamma0, Omega), a, b, omega)
+        
+        # Row-wise robust magnitudes
+        rF = row_mad_abs(F_c)                                  # [n]
+        rL = row_mad_abs(L_c_ref)                              # [n]
+
+        # Aggregate to clades with omega (one-hot or soft), using weighted mean
+        cnt_k = jnp.maximum(omega.sum(axis=0), 1e-8)           # [K]
+        sF_ref_k = (omega.T @ rF) / cnt_k                      # [K]
+        sL_ref_k = (omega.T @ rL) / cnt_k                      # [K]
+
+        # Clamp
+        smin, smax = (1e-6, 1e6)
+        sF_ref_k = jnp.clip(sF_ref_k, smin, smax)
+        sL_ref_k = jnp.clip(sL_ref_k, smin, smax)
+
+        sF_ref = sF_ref_k
+        sL_ref = sL_ref_k        
+        init_C = build_cladefgw_cost(alpha_init, C_feature, C_tree, C_space, a, b, gamma0, omega, Omega, sF_ref, sL_ref)
+        q = jnp.quantile(jnp.abs(init_C), 0.99)   
+        eps = q / max_exp_ratio                            # target max|-C/eps| ≈ 25
+        print(eps)
 
         if i == 0 and not given_gamma_ref:
             tau = 0.0
@@ -832,4 +882,329 @@ def gamma_skl(G, Gref, eps=1e-12):
     kl_pq = jnp.sum(P * (jnp.log(P + eps) - jnp.log(Q + eps)))
     kl_qp = jnp.sum(Q * (jnp.log(Q + eps) - jnp.log(P + eps)))
     return 0.5 * (kl_pq + kl_qp)
+
+def _mad_abs(M, eps=1e-12):
+    return jnp.clip(jnp.median(jnp.abs(M)), eps, 1e12)
+
+
+@jax.jit
+def make_cladexfgw_scales(C_feature, C_tree, C_space, a, b, gamma_ref):
+    """
+    Compute fixed (stop-grad) scales:
+      sF_ref : from DC(C_feature)
+      sL_ref : from DC(L_global) with Ω = all-ones
+    """
+    n = C_feature.shape[0]
+    J = jnp.ones((n, n), dtype=C_feature.dtype)
+
+    F_c = _dc_rect(C_feature, a, b)
+    # L_global = L^{Ω=J}
+    CT2, CS2 = C_tree*C_tree, C_space*C_space
+    Lg = (CT2 @ a)[:,None] + (CS2 @ b)[None,:] - 2.0 * (C_tree @ gamma_ref @ C_space.T)
+    # same as compute_Lcladegw with Ω=J
+    # Lg = compute_Lcladegw(C_tree, C_space, a, b, gamma_ref, J)
+
+    Lg_c = _dc_rect(Lg, a, b)
+
+    sF_ref = jax.lax.stop_gradient(_mad_abs(F_c))
+    sL_ref = jax.lax.stop_gradient(_mad_abs(Lg_c))
+    return sF_ref, sL_ref
+
+@jax.jit
+def build_cladexfgw_cost(
+    alpha,                  # scalar in [0,1]: features vs structure
+    alpha_cross,            # scalar ≥ 0       : weight for cross-clade structural piece
+    alpha_clades,           # [K]  ≥ 0         : per-clade within weights (row-weighted via clade_omega)
+    C_feature, C_tree, C_space,
+    a, b,                   # histograms (sum=1)
+    gamma,                  # [n,m] current coupling
+    celltype_omega,         # [n,K] row→celltype (one-hot or soft; rows sum≈1)
+    clade_omega,            # [n,K] row→clade (one-hot or soft; rows sum≈1)
+    Omega,                  # [n,n] within-clade mask (block diagonal)
+    # --- normalization knobs ---
+    sF_ref,            # scalar reference scale for features (post-DC); if None, computed on the fly
+    sL_ref,            # scalar reference scale for structure (post-DC), shared by cross+within
+    s_min=1e-6, s_max=1e6,
+    s_lo=5e-1, s_hi=2.0,
+    rel_floor=5e-2
+):
+    """
+    Returns:
+      C : [n,m] normalized mixed cost suitable for Sinkhorn
+      info : dict with diagnostics
+    Notes:
+      • Both structural pieces share a single structural scale sL_ref to keep
+        additivity (L_global_hat = L_cross_hat + L_within_hat).
+      • All scales/equalizer use stop_gradient to decouple from parameter learning.
+    """
+    n, m = C_feature.shape
+    J = jnp.ones((n, n), dtype=C_feature.dtype)
+
+    # --- 1) Build structural pieces (linear in mask), then double-center ---
+    L_within = compute_Lcladegw(C_tree, C_space, a, b, gamma, Omega)         # [n,m]
+    L_cross  = compute_Lcladegw(C_tree, C_space, a, b, gamma, (1 - Omega))    # [n,m]
+
+    F_c  = _dc_rect(C_feature, a, b)
+    Lw_c = _dc_rect(L_within,  a, b)
+    Lx_c = _dc_rect(L_cross,   a, b)
+
+    # --- 2) Reference scales (stop-grad) ---
+    sF = jax.lax.stop_gradient(jnp.clip(sF_ref, 1e-6, 1e6))   # scalar
+    sL = jax.lax.stop_gradient(jnp.clip(sL_ref, 1e-6, 1e6))   # scalar
+
+    # --- 3) Normalize pieces to comparable units ---
+    F_hat  = F_c  / sF
+    Lw_hat = Lw_c / sL
+    Lx_hat = Lx_c / sL
+
+    # --- 4) Structural mix: cross + row-weighted within ---
+    # row weights for within = (clade_omega @ alpha_clades)  → shape [n]
+    alpha_within_rows = clade_omega @ alpha_clades           # [n]
+    S_hat = (alpha_cross * Lx_hat) + (alpha_within_rows[:, None] * Lw_hat)  # [n,m]
+
+
+    # 4) per-clade medians from row medians (stop-grad)
+    mF_i = jnp.median(jnp.abs(F_hat), axis=1)                        # [n]
+    mL_i = jnp.median(jnp.abs(S_hat), axis=1)                        # [n]
+    cnt_k = jnp.maximum(clade_omega.sum(axis=0), 1e-8)                     # [K]
+    mF_k = (clade_omega.T @ mF_i) / cnt_k
+    mL_k = (clade_omega.T @ mL_i) / cnt_k
+    mF_k = jax.lax.stop_gradient(jnp.clip(mF_k, s_min, s_max))
+    mL_k = jax.lax.stop_gradient(jnp.clip(mL_k, s_min, s_max))
+
+    # --- 5) Global mix with α (features vs structure) ---\
+    C = (1.0 - celltype_omega@alpha)[:, None] * F_hat + (celltype_omega@alpha)[:, None] * S_hat                # [n,m]
+
+    # --- 6) Optional scale equalizer (stop-grad) to keep |C| stable across α ---
+    mLk_safe = jnp.maximum(mL_k, rel_floor * mF_k)                   # [K]
+    den_k = (1.0 - alpha) * mF_k + alpha * mLk_safe      # [K]
+    den_k = jnp.clip(den_k, s_min, s_max)
+    s_k   = (mF_k + mL_k) / den_k                                    # [K]
+    s_k   = jnp.clip(s_k, s_lo, s_hi)
+    s_k   = jax.lax.stop_gradient(s_k)
+
+    # 8) row equalization and return
+    s_i = clade_omega @ s_k                                                # [n]
+    C   = C * s_i[:, None]
+
+    return C
+
+def make_step_fn_cladexfgw(C_feature, true_coupling, C_tree, C_space, a, b, eps, optimizer, celltype_omega, clade_omega, Omega, sF_ref, sL_ref, T_sinkhorn=50, J_alt=3, train_mask=None, alpha_init=None):
+    if train_mask is None:
+        # default: train all
+        train_mask = jnp.ones((celltype_omega.shape[1],), dtype=jnp.float32)
+    if alpha_init is None:
+        alpha_init = jnp.full((celltype_omega.shape[1],), 0.5)
+
+    def loss_fn(params, gamma_uv):
+        gamma0, uv0 = gamma_uv
+        betas = params['betas'] # in general more than 1 because of NA clades
+        alphas = jax.nn.sigmoid(betas)  # α ∈ (0,1)
+        # alphas = jnp.clip(alphas, 0.0, 0.95)   # gradients are 0 when saturated
+        alphas = jnp.where(train_mask > 0.5, alphas, jax.lax.stop_gradient(alpha_init))
+
+        beta_cross = params['beta_cross']
+        alpha_cross = jax.nn.sigmoid(beta_cross) #* 0. + 1. # DEBUG
+
+        beta_clades = params['beta_clades']
+        alpha_clades = jax.nn.sigmoid(beta_clades)
+
+        # First alternating round uses gamma0 inside C; subsequent rounds are unrolled
+        def one_round(gamma, uv):
+            C = build_cladexfgw_cost(alphas, alpha_cross, alpha_clades, C_feature, C_tree, C_space, a, b, gamma, celltype_omega, clade_omega, Omega, sF_ref, sL_ref)
+            return sinkhorn_unrolled_safe(C, a, b, eps, T_sinkhorn, uv)
+
+        # Unroll J_alt rounds with carry
+        def body(carry, _):
+            gamma, uv = carry
+            gamma, uv = one_round(gamma, uv)
+            return (gamma, uv), None
+
+        (gamma_star, uv_star), _ = jax.lax.scan(body, (gamma0, uv0), xs=None, length=J_alt)
+
+        loss = gamma_skl(gamma_star, true_coupling)
+        return loss, ((gamma_star, uv_star), alphas, alpha_cross, alpha_clades)
+
+    @jax.jit
+    def step(params, opt_state, gamma_uv):
+        (loss_value, (gamma_uv_new, alphas, alpha_cross, alpha_clades)), g = jax.value_and_grad(loss_fn, has_aux=True)(params, gamma_uv)
+        # zero gradients on fixed alphas
+        g['betas'] = g['betas'] * train_mask
+        updates, opt_state = optimizer.update(g, opt_state, params=params)
+        # also zero updates on fixed alphas (belt & suspenders)
+        updates['betas'] = updates['betas'] * train_mask        
+        params = optax.apply_updates(params, updates)
+        return params, opt_state, gamma_uv_new, loss_value, alphas, alpha_cross, alpha_clades
+
+    return step
+
+def learn_alpha_gamma_cladexfgw(
+    C_feature, true_coupling, C_tree, C_space, a, b,
+    celltype_omega, clade_omega, Omega,
+    eps=0.05, T_sinkhorn=50, J_alt=3,
+    K_outer=200, lr=1e-2, alpha_init=None, alpha_clades_init=None, alpha_cross_init=None, train_mask=None,
+    gamma0=None, uv0=None,
+):
+    
+    K = clade_omega.shape[1]
+    if alpha_init is None:
+        alpha_init = jnp.full((celltype_omega.shape[1],), 0.5)
+
+    if alpha_clades_init is None:
+        alpha_clades_init = jnp.full((clade_omega.shape[1],), 0.5)
+
+    if alpha_cross_init is None:
+        alpha_cross_init = jnp.array([1.])
+
+    if train_mask is None:
+        train_mask = jnp.ones((celltype_omega.shape[1],), dtype=jnp.float32)
+
+    n = a.shape[0]; m = b.shape[0]
+    if gamma0 is None:
+        # uniform feasible plan as a warm start
+        gamma0 = (a[:, None] * b[None, :])
+    if uv0 is None:
+        uv0 = (jnp.ones_like(a), jnp.ones_like(b))
+
+    sF_ref, sL_ref = make_cladexfgw_scales(C_feature, C_tree, C_space, a, b, gamma0)
+
+    optimizer = optax.adam(lr)
+    betas = logit(alpha_init)
+    beta_cross = logit(alpha_cross_init)
+    beta_clades = logit(alpha_clades_init)
+    params = {"betas": betas, "beta_cross": beta_cross, "beta_clades": beta_clades}
+    opt_state = optimizer.init(params)
+
+    step = make_step_fn_cladexfgw(C_feature, true_coupling, C_tree, C_space, a, b, eps, optimizer, celltype_omega, clade_omega, Omega, sF_ref, sL_ref, T_sinkhorn, J_alt, train_mask)
+
+    gamma_uv = (gamma0, uv0)
+    loss_hist, alphas_hist, alpha_cross_hist, alpha_clades_hist = [], [], [], []
+
+    with tqdm(range(K_outer)) as pbar:
+        for _ in pbar:
+            params, opt_state, gamma_uv, loss_value, alphas, alpha_cross, alpha_clades = step(params, opt_state, gamma_uv)
+            loss_hist.append(float(loss_value))
+            alphas_hist.append(alphas)
+            alpha_cross_hist.append(alpha_cross)
+            alpha_clades_hist.append(alpha_clades)
+            pbar.set_postfix({'loss': float(loss_value)})
+
+    alpha_final = jax.nn.sigmoid(params['betas'])
+    # ensure returned alphas respect fixed ones
+    alpha_final = jnp.where(train_mask > 0.5, alpha_final, alpha_init)
+    return alpha_final, jnp.stack(alphas_hist, axis=1), jnp.array(loss_hist), gamma_uv[0], alpha_cross, alpha_clades, jnp.stack(alpha_cross_hist, axis=1), jnp.stack(alpha_clades_hist, axis=1)
+
+def make_step_fn_cladexfgw_data(C_feature, Y, C_tree, C_space, a, b, eps, optimizer, cell_type_assignments, cell_type_signatures, celltype_omega, clade_omega, Omega, sF_ref, sL_ref, T_sinkhorn=50, J_alt=3, train_mask=None, alpha_init=None, learn_scales=True):
+    if train_mask is None:
+        # default: train all
+        train_mask = jnp.ones((celltype_omega.shape[1],), dtype=jnp.float32)
+    if alpha_init is None:
+        alpha_init = jnp.full((celltype_omega.shape[1],), 0.5)
+
+    def loss_fn(params, gamma_uv):
+        gamma0, uv0 = gamma_uv
+        betas = params['betas'] # in general more than 1 because of NA clades
+        alphas = jax.nn.sigmoid(betas)  # α ∈ (0,1)
+        # alphas = jnp.clip(alphas, 0.0, 0.95)   # gradients are 0 when saturated
+        alphas = jnp.where(train_mask > 0.5, alphas, jax.lax.stop_gradient(alpha_init))
+
+        beta_cross = params['beta_cross']
+        alpha_cross = jax.nn.sigmoid(beta_cross) #* 0. + 1. # DEBUG
+
+        beta_clades = params['beta_clades']
+        alpha_clades = jax.nn.sigmoid(beta_clades)
+
+        # First alternating round uses gamma0 inside C; subsequent rounds are unrolled
+        def one_round(gamma, uv):
+            C = build_cladexfgw_cost(alphas, alpha_cross, alpha_clades, C_feature, C_tree, C_space, a, b, gamma, celltype_omega, clade_omega, Omega, sF_ref, sL_ref)
+            return sinkhorn_unrolled_safe(C, a, b, eps, T_sinkhorn, uv)
+
+        # Unroll J_alt rounds with carry
+        def body(carry, _):
+            gamma, uv = carry
+            gamma, uv = one_round(gamma, uv)
+            return (gamma, uv), None
+
+        (gamma_star, uv_star), _ = jax.lax.scan(body, (gamma0, uv0), xs=None, length=J_alt)
+
+        spot_scales = jax.nn.softplus(params['s_raw']) + 1e-6
+        loss = deconvolution_loss(Y, spot_scales, gamma_star, cell_type_assignments, cell_type_signatures)
+        return loss, ((gamma_star, uv_star), alphas, alpha_cross, alpha_clades, spot_scales)
+
+    @jax.jit
+    def step(params, opt_state, gamma_uv):
+        (loss_value, (gamma_uv_new, alphas, alpha_cross, alpha_clades, spot_scales)), g = jax.value_and_grad(loss_fn, has_aux=True)(params, gamma_uv)
+        # zero gradients on fixed alphas
+        g['betas'] = g['betas'] * train_mask
+        g['s_raw'] = g['s_raw'] * learn_scales
+        updates, opt_state = optimizer.update(g, opt_state, params=params)
+        # also zero updates on fixed alphas (belt & suspenders)
+        updates['betas'] = updates['betas'] * train_mask        
+        params = optax.apply_updates(params, updates)
+        return params, opt_state, gamma_uv_new, loss_value, alphas, alpha_cross, alpha_clades, spot_scales
+
+    return step
+
+def learn_alpha_gamma_cladexfgw_data(
+    C_feature, Y, C_tree, C_space, a, b,
+    celltype_omega, clade_omega, Omega,
+    cell_type_assignments, cell_type_signatures,
+    eps=0.05, T_sinkhorn=50, J_alt=3,
+    K_outer=200, lr=1e-2, alpha_init=None, alpha_clades_init=None, alpha_cross_init=None, train_mask=None,
+    gamma0=None, uv0=None,
+    spot_scales=None,
+):
+    
+    K = clade_omega.shape[1]
+    if alpha_init is None:
+        alpha_init = jnp.full((celltype_omega.shape[1],), 0.5)
+
+    if alpha_clades_init is None:
+        alpha_clades_init = jnp.full((clade_omega.shape[1],), 0.5)
+
+    if alpha_cross_init is None:
+        alpha_cross_init = jnp.array([1.])
+
+    if train_mask is None:
+        train_mask = jnp.ones((celltype_omega.shape[1],), dtype=jnp.float32)
+
+    n = a.shape[0]; m = b.shape[0]
+    if gamma0 is None:
+        # uniform feasible plan as a warm start
+        gamma0 = (a[:, None] * b[None, :])
+    if uv0 is None:
+        uv0 = (jnp.ones_like(a), jnp.ones_like(b))
+
+    sF_ref, sL_ref = make_cladexfgw_scales(C_feature, C_tree, C_space, a, b, gamma0)
+
+    optimizer = optax.adam(lr)
+    betas = logit(alpha_init)
+    beta_cross = logit(alpha_cross_init)
+    beta_clades = logit(alpha_clades_init)
+    s_raw = jnp.ones((Y.shape[0],1))
+    learn_scales = True
+    if spot_scales is not None:
+        s_raw = softplus_inv(spot_scales)
+        learn_scales = False
+    params = {"betas": betas, "beta_cross": beta_cross, "beta_clades": beta_clades, "s_raw": s_raw}
+    opt_state = optimizer.init(params)
+
+    step = make_step_fn_cladexfgw_data(C_feature, Y, C_tree, C_space, a, b, eps, optimizer, cell_type_assignments, cell_type_signatures, celltype_omega, clade_omega, Omega, sF_ref, sL_ref, T_sinkhorn, J_alt, train_mask, alpha_init, learn_scales)
+
+    gamma_uv = (gamma0, uv0)
+    loss_hist, alphas_hist, alpha_cross_hist, alpha_clades_hist, spot_scales_hist = [], [], [], [], []
+    with tqdm(range(K_outer)) as pbar:
+        for _ in pbar:
+            params, opt_state, gamma_uv, loss_value, alphas, alpha_cross, alpha_clades, spot_scales = step(params, opt_state, gamma_uv)
+            loss_hist.append(float(loss_value))
+            alphas_hist.append(alphas)
+            alpha_cross_hist.append(alpha_cross)
+            alpha_clades_hist.append(alpha_clades)
+            spot_scales_hist.append(spot_scales)
+            pbar.set_postfix({'loss': float(loss_value)})
+
+    alpha_final = jax.nn.sigmoid(params['betas'])
+    # ensure returned alphas respect fixed ones
+    alpha_final = jnp.where(train_mask > 0.5, alpha_final, alpha_init)
+    return alpha_final, jnp.stack(alphas_hist, axis=1), jnp.array(loss_hist), gamma_uv[0], alpha_cross, alpha_clades, jnp.stack(alpha_cross_hist, axis=1), jnp.stack(alpha_clades_hist, axis=1), jnp.stack(spot_scales_hist, axis=1)
 
