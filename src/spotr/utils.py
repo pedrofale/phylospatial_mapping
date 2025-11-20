@@ -105,10 +105,10 @@ def simulate_spatial_locations(tree_simulator, mode):
     return simulated_tree
 
 
-def simulate_expression(simulated_tree, expression_mode, n_traits, n_genes, obs_model='normal', sigma=0.1):
+def simulate_expression(simulated_tree, expression_mode, n_traits, n_genes, obs_model='normal', sigma=0.1, lib_size=10000):
     expression_modes = {
         'tree': {'alpha': 1., 'rates': [.1]*4},
-        'mix': {'alpha': 0.5, 'rates': [.1]*4},
+        'mix': {'alpha': 0.2, 'rates': [.1]*4},
         'external': {'alpha': 0., 'rates': [.1]*4},
     }
     # Each row is a gene program (signature), each column is a gene
@@ -133,7 +133,7 @@ def simulate_expression(simulated_tree, expression_mode, n_traits, n_genes, obs_
     trait_covariances = trait_covariances / 1.
 
     trait_covariances = pd.DataFrame(trait_covariances, index=["T" + str(i) for i in range(n_traits)], columns=["T" + str(i) for i in range(n_traits)])
-    spatial_activation = visium_simulator.prior(200, visium_simulator.circ_equation, decay_factor=.001, radius=50, center_x=100, center_y=100)
+    spatial_activation = visium_simulator.prior(200, visium_simulator.circ_equation, decay_factor=.0005, radius=50, center_x=100, center_y=100)
     spatial_gene_program = np.zeros((n_genes,))
     spatial_gene_program[np.random.choice(n_genes, size=5)] = 1. # activate these genes
 
@@ -153,15 +153,16 @@ def simulate_expression(simulated_tree, expression_mode, n_traits, n_genes, obs_
     if obs_model == 'normal':
         ss_transcriptomes = np.random.normal(expression, sigma)
     elif obs_model == 'poisson':
-        ss_cell_library_sizes = np.random.poisson(1000, size=ex_simulator.n_leaves) * 0 + 1
-        ss_gene_sizes = np.random.poisson(100, size=ex_simulator.n_genes) * 0 + 1            
-        ss_transcriptomes = np.random.poisson(np.exp(expression) * ss_cell_library_sizes[:, None] * ss_gene_sizes[None, :])
+        ss_cell_library_sizes = np.random.gamma(10., 1. * 100, size=ex_simulator.n_leaves) * 0 + lib_size
+        ss_gene_sizes = np.random.poisson(100, size=ex_simulator.n_genes) * 0 + 1
+        ss_transcriptomes = np.random.poisson(np.exp(expression.values)/np.sum(np.exp(expression.values), axis=1)[:, None] * ss_cell_library_sizes[:, None] * ss_gene_sizes[None, :]) # np.random.normal(expression, .1)#        
     else:
         raise ValueError(f"Invalid observation model: {obs_model}")
 
     ss_simulated_adata = anndata.AnnData(pd.DataFrame(ss_transcriptomes, index=expression.index, columns=expression.columns))
     ss_simulated_adata.raw = ss_simulated_adata.copy()
     
+    ss_simulated_adata.layers['expression'] = expression.values
     ss_simulated_adata.uns['trait_signatures'] = ex_simulator.trait_signatures
     ss_simulated_adata.obsm['trait_activations'] = trait_activations
     for trait in ex_simulator.trait_names:
@@ -189,7 +190,7 @@ def simulate_expression(simulated_tree, expression_mode, n_traits, n_genes, obs_
     return ss_simulated_adata
 
 
-def simulate_visium(ss_simulated_adata, obs_model='normal', sigma=0.1):
+def simulate_visium(ss_simulated_adata, obs_model='normal', sigma=0.1, lib_size=10000):
     n_genes = ss_simulated_adata.shape[1]
     n_traits = ss_simulated_adata.obsm['trait_activations'].shape[1]
 
@@ -222,7 +223,7 @@ def simulate_visium(ss_simulated_adata, obs_model='normal', sigma=0.1):
     clade_level1_assignments = []
     for spot in range(n_spots):
         spot_cells = np.where(cells_to_spots == f'spot_{spot}')[0]
-        spot_expression[spot] = np.mean(ss_simulated_adata.X[spot_cells], axis=0) # all transcripts
+        spot_expression[spot] = np.mean(ss_simulated_adata.layers['expression'][spot_cells], axis=0) # all transcripts
         spot_trait_activations[spot] = np.mean(ss_simulated_adata.obsm['trait_activations'].iloc[spot_cells], axis=0) # all traits
         spot_spatial_activations[spot] = np.mean(ss_simulated_adata.obs['spatial_activations'].iloc[spot_cells], axis=0) # all spatial activations
         cells_in_spots.append(len(spot_cells))
@@ -235,9 +236,9 @@ def simulate_visium(ss_simulated_adata, obs_model='normal', sigma=0.1):
     if obs_model == 'normal':
         spatial_transcriptomes = np.random.normal(spot_expression, sigma)
     elif obs_model == 'poisson':
-        spatial_spot_library_sizes = np.random.poisson(1000, size=n_spots) * 0 + 1
+        spatial_spot_library_sizes = np.random.poisson(lib_size, size=n_spots) * 0 + lib_size
         spatial_spot_gene_sizes = np.random.poisson(100, size=n_genes) * 0 + 1
-        spatial_transcriptomes = np.random.poisson(np.exp(spot_expression) * spatial_spot_library_sizes[:, None] * spatial_spot_gene_sizes[None, :])
+        spatial_transcriptomes = np.random.poisson(np.exp(spot_expression)/np.sum(np.exp(spot_expression), axis=1)[:, None] * spatial_spot_library_sizes[:, None] * spatial_spot_gene_sizes[None, :]) # np.random.normal(spot_expression, .01)#
     else:
         raise ValueError(f"Invalid observation model: {obs_model}")
 
@@ -258,7 +259,7 @@ def simulate_visium(ss_simulated_adata, obs_model='normal', sigma=0.1):
     spatial_simulated_adata = spatial_simulated_adata[spatial_simulated_adata.obs['clade_level2'].sort_values().index]
     return spatial_simulated_adata
 
-def simulate_data(spatial_mode, expression_mode, n_cells=512, n_genes=10, n_traits=5, obs_model='normal', sigma=0.1, seed=42):
+def simulate_data(spatial_mode, expression_mode, n_cells=512, n_genes=10, n_traits=5, obs_model='normal', sigma=0.1, ss_lib_size=10000, spatial_lib_size=10000, seed=42):
     np.random.seed(seed)
     tree_simulator = cas.sim.CompleteBinarySimulator(num_cells=n_cells)
 
@@ -266,10 +267,10 @@ def simulate_data(spatial_mode, expression_mode, n_cells=512, n_genes=10, n_trai
     simulated_tree = simulate_spatial_locations(tree_simulator, spatial_mode)
     
     # Simulate expression
-    ss_simulated_adata = simulate_expression(simulated_tree, expression_mode, n_traits, n_genes, obs_model=obs_model, sigma=sigma)
+    ss_simulated_adata = simulate_expression(simulated_tree, expression_mode, n_traits, n_genes, obs_model=obs_model, sigma=sigma, lib_size=ss_lib_size)
 
     # Simulate spatial gene expression data
-    spatial_simulated_adata = simulate_visium(ss_simulated_adata, obs_model=obs_model, sigma=sigma)
+    spatial_simulated_adata = simulate_visium(ss_simulated_adata, obs_model=obs_model, sigma=sigma, lib_size=spatial_lib_size)
 
     # Get distance matrices
     tree_distance_matrix = cas.data.compute_phylogenetic_weight_matrix(simulated_tree)
