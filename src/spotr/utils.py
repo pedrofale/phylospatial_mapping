@@ -341,7 +341,7 @@ def compute_inferred_clade_fractions(ss_simulated_adata, coupling, spatial_simul
     spatial_simulated_adata.obsm[key] = inferred_clade_fractions_df
 
 
-def compute_clades_pearson_corr(true_fractions, inferred_fractions):
+def compute_clades_pearson_corr(true_fractions, inferred_fractions, return_all=False):
     """
     Compute the mean Pearson correlation between true and estimated clade fractions across spots.
 
@@ -364,7 +364,10 @@ def compute_clades_pearson_corr(true_fractions, inferred_fractions):
         per_clade_corrs.append(r)
 
     mean_pearson_corr = np.mean(per_clade_corrs)
-    return mean_pearson_corr    
+    if return_all:
+        return mean_pearson_corr, per_clade_corrs
+    else:
+        return mean_pearson_corr
 
 
 def dc_square(D2, w):
