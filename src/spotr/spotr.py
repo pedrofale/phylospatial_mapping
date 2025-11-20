@@ -767,7 +767,7 @@ def prepare_ot_inputs(ss_simulated_adata, spatial_simulated_adata, tree_distance
 
     return C_feature, C_tree, C_space, a, b
 
-def run_spotr(ss_simulated_adata, spatial_simulated_adata, tree_distance_matrix, spatial_distance_matrix, 
+def run_spotr_(ss_simulated_adata, spatial_simulated_adata, tree_distance_matrix, spatial_distance_matrix, 
             cell_type_assignments, cell_type_signatures, clade_columns=['clade_level0', 'clade_level1', 'clade_level2'], gamma_ref=None,
             eps=0.01, T_sinkhorn=100, J_alt=20, K_outer=100, lr=1e-2, clade_to_ignore='NA', alpha=0.5, tau=5.0, spot_scales_ref=None, max_exp_ratio=25.0):
     
@@ -964,8 +964,8 @@ def build_cladexfgw_cost(
 
 
     # 4) per-clade medians from row medians (stop-grad)
-    mF_i = jnp.median(jnp.abs(F_hat), axis=1)                        # [n]
-    mL_i = jnp.median(jnp.abs(S_hat), axis=1)                        # [n]
+    mF_i = row_mad_abs(F_hat)                        # [n]
+    mL_i = row_mad_abs(S_hat)                        # [n]
     cnt_k = jnp.maximum(clade_omega.sum(axis=0), 1e-8)                     # [K]
     mF_k = (clade_omega.T @ mF_i) / cnt_k
     mL_k = (clade_omega.T @ mL_i) / cnt_k
@@ -1080,6 +1080,11 @@ def learn_alpha_gamma_cladexfgw(
     gamma_uv = (gamma0, uv0)
     loss_hist, alphas_hist, alpha_cross_hist, alpha_clades_hist = [], [], [], []
 
+    early_stop_patience = 10  # number of iterations to wait before early stopping
+    early_stop_delta = 1e-6   # tolerance for loss convergence
+    best_loss = float('inf')
+    patience_counter = 0
+
     with tqdm(range(K_outer)) as pbar:
         for _ in pbar:
             params, opt_state, gamma_uv, loss_value, alphas, alpha_cross, alpha_clades = step(params, opt_state, gamma_uv)
@@ -1088,6 +1093,16 @@ def learn_alpha_gamma_cladexfgw(
             alpha_cross_hist.append(alpha_cross)
             alpha_clades_hist.append(alpha_clades)
             pbar.set_postfix({'loss': float(loss_value)})
+
+            # Early stopping check
+            if float(loss_value) < best_loss - early_stop_delta:
+                best_loss = float(loss_value)
+                patience_counter = 0
+            else:
+                patience_counter += 1
+            if patience_counter >= early_stop_patience:
+                print(f"Early stopping at iteration {len(loss_hist)}; loss has converged.")
+                break
 
     alpha_final = jax.nn.sigmoid(params['betas'])
     # ensure returned alphas respect fixed ones
@@ -1206,5 +1221,77 @@ def learn_alpha_gamma_cladexfgw_data(
     alpha_final = jax.nn.sigmoid(params['betas'])
     # ensure returned alphas respect fixed ones
     alpha_final = jnp.where(train_mask > 0.5, alpha_final, alpha_init)
-    return alpha_final, jnp.stack(alphas_hist, axis=1), jnp.array(loss_hist), gamma_uv[0], alpha_cross, alpha_clades, jnp.stack(alpha_cross_hist, axis=1), jnp.stack(alpha_clades_hist, axis=1), jnp.stack(spot_scales_hist, axis=1)
+    return alpha_final, jnp.stack(alphas_hist, axis=1), jnp.array(loss_hist), gamma_uv[0], alpha_cross, alpha_clades, jnp.stack(alpha_cross_hist, axis=1), jnp.stack(alpha_clades_hist, axis=1), jnp.stack(spot_scales_hist, axis=1), spot_scales
 
+
+def run_spotr(ss_simulated_adata, spatial_simulated_adata, tree_distance_matrix, spatial_distance_matrix, 
+            cell_type_assignments, cell_type_signatures, clade_column='clade_level2', gamma_ref=None,
+            eps=0.01, T_sinkhorn=100, J_alt=3, n_iters=1000, lr=1e-1, clade_to_ignore='NA', alpha=0.5, spot_scales_ref=None, max_exp_ratio=25.0):
+    
+    C_feature, C_tree, C_space, a, b = prepare_ot_inputs(ss_simulated_adata, spatial_simulated_adata, tree_distance_matrix, spatial_distance_matrix)
+
+    # Initialize with features only OT
+    gamma0, uv0 = sinkhorn_fgw(C_feature, C_tree, C_space, a, b, eps, 
+                                T_sinkhorn=50, J_alt=1, alpha=0., gamma0=None, uv0=None)
+
+    Y = jnp.asarray(spatial_simulated_adata.layers['counts'])            
+    n_cells = ss_simulated_adata.shape[0]
+
+    cell_clades = ss_simulated_adata.obs[clade_column].values
+    clades = np.unique(cell_clades)
+    n_clades = len(clades) # includes clades that we shouldn't learn alphas for
+    n_celltypes = 1
+    if clade_to_ignore in clades:
+        n_celltypes += 1
+    # Turn off alpha learning for NA clades
+    alpha_init = np.full((n_celltypes,), alpha)
+    train_mask = np.ones((n_celltypes,), dtype=np.float32) # train all alphas by default
+    fixed_alpha_celltypes = np.where(cell_clades == clade_to_ignore)[0]
+    train_mask[fixed_alpha_celltypes] = 0.0
+    alpha_init[fixed_alpha_celltypes] = 0.0
+    train_mask = jnp.array(train_mask)
+    alpha_init = jnp.array(alpha_init)
+
+    alpha_cross_init = jnp.array([alpha])
+    alpha_clades_init = np.full((n_clades,), alpha)
+
+    celltype_omega = np.zeros((n_cells, n_celltypes))
+    celltype_omega[np.where(cell_clades != clade_to_ignore)[0], 0] = 1.0
+    if n_celltypes > 1:
+        celltype_omega[np.where(cell_clades == clade_to_ignore)[0], 1] = 1.0
+    
+    # omega: (n_cells, n_clades), one-hot encoding each cell's clade
+    clade_to_idx = {clade: i for i, clade in enumerate(clades)}
+    clade_omega = np.zeros((n_cells, n_clades), dtype=np.float32)
+    for c, clade in enumerate(cell_clades):
+        clade_omega[c, clade_to_idx[clade]] = 1.0
+
+    # Omega is (n_cells, n_cells), 1 if same clade, else 0. Now rescale so within each clade, values are 1/(size of clade).
+    Omega = (clade_omega @ clade_omega.T).astype(np.float32)
+    clade_omega = jnp.array(clade_omega)
+    celltype_omega = jnp.array(celltype_omega)
+    Omega = jnp.array(Omega)
+
+    alpha_final, alphas_hist, loss_hist, coupling, alpha_cross, alpha_clades, alpha_cross_hist, alpha_clades_hist, spot_scales_hist, spot_scales = learn_alpha_gamma_cladexfgw_data(
+        C_feature, Y, C_tree, C_space, a, b,
+        celltype_omega, clade_omega, Omega,
+        cell_type_assignments, cell_type_signatures,
+        eps=eps, T_sinkhorn=T_sinkhorn, J_alt=J_alt,
+        K_outer=n_iters, lr=lr, alpha_init=alpha_init, alpha_clades_init=alpha_clades_init, alpha_cross_init=alpha_cross_init, train_mask=train_mask,
+        gamma0=gamma0, uv0=None, 
+        spot_scales=spot_scales_ref
+    )    
+
+    results = {
+        'alpha': alpha_final,
+        'alpha_hist': alphas_hist,
+        'alpha_cross': alpha_cross,
+        'alpha_cross_hist': alpha_cross_hist,
+        'alpha_clades': dict(zip(clades, alpha_clades)),
+        'alpha_clades_hist': alpha_clades_hist,
+        'loss_hist': loss_hist,
+        'coupling': coupling,
+        'spot_scales': spot_scales,
+    }
+
+    return results
