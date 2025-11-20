@@ -1,0 +1,32 @@
+name: benchmark_env 
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.10
+  - squidpy
+  - ipykernel
+  - notebook
+  - jax
+  - jaxlib
+  - optax
+  - tqdm
+  - scvi-tools
+  - pip
+  - pip:
+    - "cassiopeia-lineage @ git+https://github.com/YosefLab/Cassiopeia"
+    - tfp-nightly[jax]
+    - pot
+    - opencv-python
+    - scikit-image
+    - scikit-learn
+    - torch
+    - torchaudio
+    - torchmetrics
+    - torchvision
+    - pycea-lineage
+
+    
+
+
+
