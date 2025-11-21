@@ -43,14 +43,69 @@ def _deconvolution_loss(Y, gamma, cell_type_assignments, cell_type_signatures, s
     spot_mean = jnp.einsum('jk,kg->jg', spot_cell_type_proportions, cell_type_signatures)
     return -tfp.distributions.Normal(spot_mean, sigma).log_prob(Y).sum()
 
-def deconvolution_loss(Y, spot_scales, gamma, cell_type_assignments, cell_type_signatures):
+def init_spot_scales(Y, gamma, cell_type_assignments, cell_type_signatures,
+                     prior_a=1.0, prior_b=1.0, eps=1e-8, clip=(1e-3, 1e3)):
+    # Y: [m, G], gamma: [n, m], assignments: [n, C], signatures: [C, G]
+    # 1) spot-level clone proportions
+    spot_ct = jnp.einsum('ji,ic->jc', gamma.T * gamma.shape[1], cell_type_assignments)  # [m,C]
+    # 2) predicted means per gene (without scale)
+    mu = jnp.einsum('jc,cg->jg', spot_ct, cell_type_signatures)        # [m,G]
+    # 3) MAP init per spot
+    num = jnp.sum(Y, axis=1) + (prior_a - 1.0)
+    den = jnp.sum(mu, axis=1) + prior_b + eps
+    s0  = num / den
+    # keep positive & reasonable
+    s0 = jnp.clip(s0, clip[0], clip[1])
+    return s0
+
+def init_spot_gene_scales(Y, gamma, cell_type_assignments, cell_type_signatures,
+                          a_s=1.0, b_s=1.0, a_g=1.0, b_g=1.0,
+                          iters=2, eps=1e-8, clip=(1e-4, 1e4)):
+    """
+    Returns s0 [m], g0 [G] initialized by a few alternating MAP updates,
+    then recenters so geometric means are 1 (breaks scale degeneracy).
+    """
+    # 1) compute mu_jg (predicted mean without scales)
+    # spot_ct: [m,C], mu: [m,G]
+    spot_ct = jnp.einsum('ji,ic->jc', gamma.T, cell_type_assignments)
+    mu = jnp.einsum('jc,cg->jg', spot_ct, cell_type_signatures)
+
+    m, G = Y.shape
+    s = jnp.ones((m,))
+    g = jnp.ones((G,))
+
+    def one_iter(carry, _):
+        s, g = carry
+        # update s
+        num_s = jnp.sum(Y, axis=1) + (a_s - 1.0)
+        den_s = jnp.sum(mu * g[None, :], axis=1) + b_s + eps
+        s = jnp.clip(num_s / den_s, clip[0], clip[1])
+        # update g
+        num_g = jnp.sum(Y, axis=0) + (a_g - 1.0)
+        den_g = jnp.sum(mu * s[:, None], axis=0) + b_g + eps
+        g = jnp.clip(num_g / den_g, clip[0], clip[1])
+        return (s, g), None
+
+    (s, g), _ = jax.lax.scan(one_iter, (s, g), xs=None, length=iters)
+
+    # 2) recenter to fix geometric means to 1 (breaks s<->g scaling ambiguity)
+    log_s = jnp.log(jnp.clip(s, clip[0], clip[1]))
+    log_g = jnp.log(jnp.clip(g, clip[0], clip[1]))
+    log_s = log_s - jnp.mean(log_s)
+    log_g = log_g - jnp.mean(log_g)
+    s0 = jnp.clip(jnp.exp(log_s), clip[0], clip[1])
+    g0 = jnp.clip(jnp.exp(log_g), clip[0], clip[1])
+    return s0, g0
+
+def deconvolution_loss(Y, spot_scales, gene_scales, gamma, cell_type_assignments, cell_type_signatures):
     """
     Outer loss: scalar function of the transport plan gamma [n, m].
     """
-    spot_cell_type_proportions = jnp.einsum('ji,ik->jk', gamma.T * gamma.shape[1], cell_type_assignments)
+    spot_cell_type_proportions = jnp.einsum('ji,ik->jk', gamma.T, cell_type_assignments)
     spot_mean = jnp.einsum('jk,kg->jg', spot_cell_type_proportions, cell_type_signatures)
-    ll = tfp.distributions.Poisson(spot_mean * spot_scales).log_prob(Y).sum()    
+    ll = tfp.distributions.Poisson(spot_mean * spot_scales * gene_scales).log_prob(Y).sum()    
     lp = tfp.distributions.Gamma(1., 1.).log_prob(spot_scales).sum()
+    lp += tfp.distributions.Gamma(1., 1.).log_prob(gene_scales).sum()
     return -(ll + lp) # loss
 
 @jax.jit
@@ -507,6 +562,7 @@ def make_step_fn_cladefgw(C_feature, Y, C_tree, C_space, a, b, eps, optimizer, c
         gamma0, uv0 = gamma_uv
         betas = params['betas']
         spot_scales = jax.nn.softplus(params['s_raw']) + 1e-6 # ensure positive
+        gene_scales = jax.nn.softplus(params['g_raw']) + 1e-6 # ensure positive
         alphas = jax.nn.sigmoid(betas)  # α ∈ (0,1)
         alphas = jnp.clip(alphas, 0.0, 0.95)   # gradients are 0 when saturated
         alphas = jnp.where(train_mask > 0.5, alphas, jax.lax.stop_gradient(alpha_init))
@@ -524,8 +580,8 @@ def make_step_fn_cladefgw(C_feature, Y, C_tree, C_space, a, b, eps, optimizer, c
 
         (gamma_star, uv_star), _ = jax.lax.scan(body, (gamma0, uv0), xs=None, length=J_alt)
 
-        loss = deconvolution_loss(Y, spot_scales, gamma_star, cell_type_assignments, cell_type_signatures)
-        return loss, ((gamma_star, uv_star), alphas, spot_scales)
+        loss = deconvolution_loss(Y, spot_scales, gene_scales, gamma_star, cell_type_assignments, cell_type_signatures)
+        return loss, ((gamma_star, uv_star), alphas, spot_scales, gene_scales)
 
     @jax.jit
     def step(params, opt_state, gamma_uv):
@@ -591,29 +647,126 @@ def learn_alpha_gamma_cladefgw(
     optimizer = optax.adam(lr)
     betas = logit(alpha_init)
     s_raw = jnp.ones((Y.shape[0],1))
-    params = {"betas": betas, "s_raw": s_raw}
+    g_raw = jnp.ones((1, Y.shape[1]))
+    params = {"betas": betas, "s_raw": s_raw, "g_raw": g_raw}
     opt_state = optimizer.init(params)
 
     step = make_step_fn_cladefgw(C_feature, Y, C_tree, C_space, a, b, eps, optimizer, cell_type_assignments, cell_type_signatures, omega, Omega, sF_ref, sL_ref, T_sinkhorn, J_alt, train_mask, alpha_init)
 
     gamma_uv = (gamma0, uv0)
-    loss_hist, alphas_hist, spot_scales_hist = [], [], []
+    loss_hist, alphas_hist, spot_scales_hist, gene_scales_hist = [], [], [], []
 
     with tqdm(range(K_outer)) as pbar:
         for _ in pbar:
-            params, opt_state, gamma_uv, loss_value, alphas, spot_scales = step(params, opt_state, gamma_uv)
+            params, opt_state, gamma_uv, loss_value, alphas, spot_scales, gene_scales = step(params, opt_state, gamma_uv)
             loss_hist.append(float(loss_value))
             alphas_hist.append(alphas)
             spot_scales_hist.append(spot_scales)
+            gene_scales_hist.append(gene_scales)
             pbar.set_postfix({'loss': float(loss_value)})
 
     alpha_final = jax.nn.sigmoid(params['betas'])
     # ensure returned alphas respect fixed ones
     alpha_final = jnp.where(train_mask > 0.5, alpha_final, alpha_init)
-    return alpha_final, jnp.stack(alphas_hist, axis=1), jnp.array(loss_hist), gamma_uv[0], spot_scales, jnp.stack(spot_scales_hist, axis=1)
+    return alpha_final, jnp.stack(alphas_hist, axis=1), jnp.array(loss_hist), gamma_uv[0], spot_scales, jnp.stack(spot_scales_hist, axis=1), jnp.stack(gene_scales_hist, axis=1)
 
 
-def prepare_ot_inputs(ss_simulated_adata, spatial_simulated_adata, tree_distance_matrix, spatial_distance_matrix):
+def dc_rect(M, a, b):
+    r = M @ b
+    c = M.T @ a
+    mu = jnp.dot(a, r)
+    return M - r[:,None] - c[None,:] + mu
+
+def dc_square(M, w):
+    r = M @ w
+    c = M.T @ w
+    mu = jnp.dot(w, r)
+    return M - r[:,None] - c[None,:] + mu
+
+def safe_calibrate(C_feat, C_T, C_S, a, b, eps, gamma_ref=None,
+                   target_med=1.0, M_cap=80.0, eps_min=1e-12):
+    """
+    Returns (C_feat_sc, C_T_sc, C_S_sc) with controlled scale.
+    Preconditions:
+      - C_T, C_S are raw distances (not squared), scaled roughly to [0,1].
+      - a, b sum to 1.
+    Guarantees:
+      - median(|DC(L_ref)|) ~= median(|DC(C_feat)|) up to a cap.
+      - max(|DC(L_ref)|)/eps <= M_cap  (prevents exp(-C/eps) overflow).
+    """
+    if gamma_ref is None:
+        gamma_ref = a[:, None] * b[None, :]
+
+    # 0) check/normalize a,b
+    a = a / (a.sum() + eps_min)
+    b = b / (b.sum() + eps_min)
+
+    # 1) double-center features
+    F_c = dc_rect(C_feat, a, b)
+    mF  = jnp.median(jnp.abs(F_c)) + eps_min
+
+    # 2) build L_ref from RAW distances (only square once here)
+    CT, CS = C_T, C_S
+    L_ref = ( (CT*CT) @ a )[:,None] + ( (CS*CS) @ b )[None,:] - 2.0 * (CT @ gamma_ref @ CS.T)
+    Lc_ref = dc_rect(L_ref, a, b)
+
+    # 3) structural-to-feature matching, with robust floors/caps
+    mL   = jnp.median(jnp.abs(Lc_ref)) + eps_min
+    sL1  = mF / mL                      # match medians
+    # cap by feasible exponent band
+    maxL = jnp.max(jnp.abs(Lc_ref)) + eps_min
+    sL2  = (M_cap * eps) / maxL         # ensures max(|sL*L|)/eps <= M_cap
+    sL   = jnp.minimum(sL1, sL2)        # take the safer scale
+
+    # 4) finalize:
+    C_feat_sc = C_feat                  # leave features as-is
+    C_T_sc    = jnp.sqrt(sL) * CT
+    C_S_sc    = jnp.sqrt(sL) * CS
+    return C_feat_sc, C_T_sc, C_S_sc
+
+def calibrate_structural_scale(C_feat, C_T, C_S, a, b, eps=0.1, gamma_ref=None,
+                   target_med=1.0, M_cap=80.0, eps_min=1e-12):
+    """
+    Returns (C_feat_sc, C_T_sc, C_S_sc) with controlled scale.
+    Preconditions:
+      - C_T, C_S are raw distances (not squared), scaled roughly to [0,1].
+      - a, b sum to 1.
+    Guarantees:
+      - median(|DC(L_ref)|) ~= median(|DC(C_feat)|) up to a cap.
+      - max(|DC(L_ref)|)/eps <= M_cap  (prevents exp(-C/eps) overflow).
+    """
+    if gamma_ref is None:
+        gamma_ref = a[:, None] * b[None, :]
+
+    # 0) check/normalize a,b
+    a = a / (a.sum() + eps_min)
+    b = b / (b.sum() + eps_min)
+
+    # 1) double-center features
+    F_c = dc_rect(C_feat, a, b)
+    mF  = jnp.median(jnp.abs(F_c)) + eps_min
+
+    # 2) build L_ref from RAW distances (only square once here)
+    CT, CS = C_T, C_S
+    L_ref = ( (CT*CT) @ a )[:,None] + ( (CS*CS) @ b )[None,:] - 2.0 * (CT @ gamma_ref @ CS.T)
+    Lc_ref = dc_rect(L_ref, a, b)
+
+    # 3) structural-to-feature matching, with robust floors/caps
+    mL   = jnp.median(jnp.abs(Lc_ref)) + eps_min
+    sL1  = mF / mL                      # match medians
+    # cap by feasible exponent band
+    maxL = jnp.max(jnp.abs(Lc_ref)) + eps_min
+    sL2  = (M_cap * eps) / maxL         # ensures max(|sL*L|)/eps <= M_cap
+    sL   = jnp.minimum(sL1, sL2)        # take the safer scale
+
+    # 4) finalize:
+    C_feat_sc = C_feat                  # leave features as-is
+    C_T_sc    = jnp.sqrt(sL) * CT
+    C_S_sc    = jnp.sqrt(sL) * CS
+    return C_feat_sc, C_T_sc, C_S_sc, None
+
+
+def prepare_ot_inputs(ss_simulated_adata, spatial_simulated_adata, tree_distance_matrix, spatial_distance_matrix, gamma_ref=None):
     X = jnp.asarray(ss_simulated_adata.X)
     Y = jnp.asarray(spatial_simulated_adata.X)
     a = jnp.ones(X.shape[0]) / X.shape[0]
@@ -624,8 +777,8 @@ def prepare_ot_inputs(ss_simulated_adata, spatial_simulated_adata, tree_distance
     C_feature = C_feature / C_feature.max()
 
     # Do we need this?
-    # C_feat_sc, C_tree_sc, C_space_sc, info = preprocess_costs(
-    #     C_feature, C_tree, C_space, a, b, mode="gw_balanced"
+    # C_feature, C_tree, C_space, info = calibrate_structural_scale(
+    #     C_feature, C_tree, C_space, a, b
     # )
 
     return C_feature, C_tree, C_space, a, b
@@ -645,7 +798,7 @@ def _mad_abs(M, eps=1e-12):
 
 
 @jax.jit
-def make_cladexfgw_scales(C_feature, C_tree, C_space, a, b, gamma_ref):
+def make_cladexfgw_scales(C_feature, C_tree, C_space, a, b, gamma_ref, s_min=1e-6, s_max=1e6, eps=1e-2, M_cap=80.0):
     """
     Compute fixed (stop-grad) scales:
       sF_ref : from DC(C_feature)
@@ -661,11 +814,24 @@ def make_cladexfgw_scales(C_feature, C_tree, C_space, a, b, gamma_ref):
     # same as compute_Lcladegw with Ω=J
     # Lg = compute_Lcladegw(C_tree, C_space, a, b, gamma_ref, J)
 
-    Lg_c = _dc_rect(Lg, a, b)
+    L_c = _dc_rect(Lg, a, b)
 
-    sF_ref = jax.lax.stop_gradient(_mad_abs(F_c))
-    sL_ref = jax.lax.stop_gradient(_mad_abs(Lg_c))
-    return sF_ref, sL_ref
+    # robust spreads
+    mF  = jnp.median(jnp.abs(F_c)) + 1e-12
+    mL  = jnp.median(jnp.abs(L_c)) + 1e-12
+    # absolute maxima (for exponent capping)
+    MF  = jnp.max(jnp.abs(F_c)) + 1e-12
+    ML  = jnp.max(jnp.abs(L_c)) + 1e-12
+
+    # Floors so we NEVER divide by a tiny number (i.e., never up-scale)
+    # Also enforce: max(|F_c|/sF)/eps <= M_cap  ⇒  sF >= MF/(M_cap*eps)
+    sF_floor = jnp.maximum(s_min, MF/(M_cap*eps))
+    sL_floor = jnp.maximum(s_min, ML/(M_cap*eps))
+
+    # Choose scale = max(median, floor). This only down-scales (or leaves), never boosts.
+    sF = jax.lax.stop_gradient(jnp.maximum(mF, sF_floor))
+    sL = jax.lax.stop_gradient(jnp.maximum(mL, sL_floor))
+    return sF, sL
 
 @jax.jit
 def build_cladexfgw_cost(
@@ -801,6 +967,8 @@ def learn_alpha_gamma_cladexfgw(
     eps=0.05, T_sinkhorn=50, J_alt=3,
     K_outer=200, lr=1e-2, alpha_init=None, alpha_clades_init=None, alpha_cross_init=None, train_mask=None,
     gamma0=None, uv0=None,
+    early_stop_patience = 10,
+    early_stop_delta = 1e-6,
 ):
     
     K = clade_omega.shape[1]
@@ -823,7 +991,7 @@ def learn_alpha_gamma_cladexfgw(
     if uv0 is None:
         uv0 = (jnp.ones_like(a), jnp.ones_like(b))
 
-    sF_ref, sL_ref = make_cladexfgw_scales(C_feature, C_tree, C_space, a, b, gamma0)
+    sF_ref, sL_ref = make_cladexfgw_scales(C_feature, C_tree, C_space, a, b, gamma0, eps=eps)
 
     optimizer = optax.adam(lr)
     betas = logit(alpha_init)
@@ -837,8 +1005,6 @@ def learn_alpha_gamma_cladexfgw(
     gamma_uv = (gamma0, uv0)
     loss_hist, alphas_hist, alpha_cross_hist, alpha_clades_hist = [], [], [], []
 
-    early_stop_patience = 10  # number of iterations to wait before early stopping
-    early_stop_delta = 1e-6   # tolerance for loss convergence
     best_loss = float('inf')
     patience_counter = 0
 
@@ -881,7 +1047,7 @@ def make_step_fn_cladexfgw_data(C_feature, Y, C_tree, C_space, a, b, eps, optimi
         alphas = jnp.where(train_mask > 0.5, alphas, jax.lax.stop_gradient(alpha_init))
 
         beta_cross = params['beta_cross']
-        alpha_cross = jax.nn.sigmoid(beta_cross) #* 0. + 1. # DEBUG
+        alpha_cross = jax.nn.sigmoid(beta_cross) * 0. + 1. # DEBUG
 
         beta_clades = params['beta_clades']
         alpha_clades = jax.nn.sigmoid(beta_clades)
@@ -900,12 +1066,13 @@ def make_step_fn_cladexfgw_data(C_feature, Y, C_tree, C_space, a, b, eps, optimi
         (gamma_star, uv_star), _ = jax.lax.scan(body, (gamma0, uv0), xs=None, length=J_alt)
 
         spot_scales = jax.nn.softplus(params['s_raw']) + 1e-6
-        loss = deconvolution_loss(Y, spot_scales, gamma_star, cell_type_assignments, cell_type_signatures)
-        return loss, ((gamma_star, uv_star), alphas, alpha_cross, alpha_clades, spot_scales)
+        gene_scales = jax.nn.softplus(params['g_raw']) + 1e-6
+        loss = deconvolution_loss(Y, spot_scales, gene_scales, gamma_star, cell_type_assignments, cell_type_signatures)
+        return loss, ((gamma_star, uv_star), alphas, alpha_cross, alpha_clades, spot_scales, gene_scales)
 
     @jax.jit
     def step(params, opt_state, gamma_uv):
-        (loss_value, (gamma_uv_new, alphas, alpha_cross, alpha_clades, spot_scales)), g = jax.value_and_grad(loss_fn, has_aux=True)(params, gamma_uv)
+        (loss_value, (gamma_uv_new, alphas, alpha_cross, alpha_clades, spot_scales, gene_scales)), g = jax.value_and_grad(loss_fn, has_aux=True)(params, gamma_uv)
         # zero gradients on fixed alphas
         g['betas'] = g['betas'] * train_mask
         g['s_raw'] = g['s_raw'] * learn_scales
@@ -913,7 +1080,7 @@ def make_step_fn_cladexfgw_data(C_feature, Y, C_tree, C_space, a, b, eps, optimi
         # also zero updates on fixed alphas (belt & suspenders)
         updates['betas'] = updates['betas'] * train_mask        
         params = optax.apply_updates(params, updates)
-        return params, opt_state, gamma_uv_new, loss_value, alphas, alpha_cross, alpha_clades, spot_scales
+        return params, opt_state, gamma_uv_new, loss_value, alphas, alpha_cross, alpha_clades, spot_scales, gene_scales
 
     return step
 
@@ -925,6 +1092,8 @@ def learn_alpha_gamma_cladexfgw_data(
     K_outer=200, lr=1e-2, alpha_init=None, alpha_clades_init=None, alpha_cross_init=None, train_mask=None,
     gamma0=None, uv0=None,
     spot_scales=None,
+    early_stop_patience = 10,
+    early_stop_delta = 1e-6,
 ):
     
     K = clade_omega.shape[1]
@@ -953,39 +1122,59 @@ def learn_alpha_gamma_cladexfgw_data(
     betas = logit(alpha_init)
     beta_cross = logit(alpha_cross_init)
     beta_clades = logit(alpha_clades_init)
-    s_raw = jnp.ones((Y.shape[0],1))
+    s_raw, g_raw = init_spot_gene_scales(Y, gamma0, cell_type_assignments, cell_type_signatures)
+    s_raw = softplus_inv(s_raw)
+    s_raw = jnp.array(s_raw[:,None])
+    g_raw = softplus_inv(g_raw)
+    g_raw = jnp.array(g_raw[None,:])
     learn_scales = True
     if spot_scales is not None:
         s_raw = softplus_inv(spot_scales)
         learn_scales = False
-    params = {"betas": betas, "beta_cross": beta_cross, "beta_clades": beta_clades, "s_raw": s_raw}
+    params = {"betas": betas, "beta_cross": beta_cross, "beta_clades": beta_clades, "s_raw": s_raw, "g_raw": g_raw}
     opt_state = optimizer.init(params)
 
     step = make_step_fn_cladexfgw_data(C_feature, Y, C_tree, C_space, a, b, eps, optimizer, cell_type_assignments, cell_type_signatures, celltype_omega, clade_omega, Omega, sF_ref, sL_ref, T_sinkhorn, J_alt, train_mask, alpha_init, learn_scales)
 
     gamma_uv = (gamma0, uv0)
-    loss_hist, alphas_hist, alpha_cross_hist, alpha_clades_hist, spot_scales_hist = [], [], [], [], []
+    loss_hist, alphas_hist, alpha_cross_hist, alpha_clades_hist, spot_scales_hist, gene_scales_hist = [], [], [], [], [], []
+    best_loss = float('inf')
+    patience_counter = 0
     with tqdm(range(K_outer)) as pbar:
         for _ in pbar:
-            params, opt_state, gamma_uv, loss_value, alphas, alpha_cross, alpha_clades, spot_scales = step(params, opt_state, gamma_uv)
+            params, opt_state, gamma_uv, loss_value, alphas, alpha_cross, alpha_clades, spot_scales, gene_scales = step(params, opt_state, gamma_uv)
             loss_hist.append(float(loss_value))
             alphas_hist.append(alphas)
             alpha_cross_hist.append(alpha_cross)
             alpha_clades_hist.append(alpha_clades)
             spot_scales_hist.append(spot_scales)
+            gene_scales_hist.append(gene_scales)
             pbar.set_postfix({'loss': float(loss_value)})
+
+            # Early stopping check
+            if float(loss_value) < best_loss - early_stop_delta:
+                best_loss = float(loss_value)
+                patience_counter = 0
+            else:
+                patience_counter += 1
+            if patience_counter >= early_stop_patience:
+                print(f"Early stopping at iteration {len(loss_hist)}; loss has converged.")
+                break
 
     alpha_final = jax.nn.sigmoid(params['betas'])
     # ensure returned alphas respect fixed ones
     alpha_final = jnp.where(train_mask > 0.5, alpha_final, alpha_init)
-    return alpha_final, jnp.stack(alphas_hist, axis=1), jnp.array(loss_hist), gamma_uv[0], alpha_cross, alpha_clades, jnp.stack(alpha_cross_hist, axis=1), jnp.stack(alpha_clades_hist, axis=1), jnp.stack(spot_scales_hist, axis=1), spot_scales
+    return alpha_final, jnp.stack(alphas_hist, axis=1), jnp.array(loss_hist), gamma_uv[0], alpha_cross, alpha_clades, jnp.stack(alpha_cross_hist, axis=1), jnp.stack(alpha_clades_hist, axis=1), spot_scales,jnp.stack(spot_scales_hist, axis=1), jnp.stack(gene_scales_hist, axis=1), gene_scales
 
 
 def run_spotr(ss_simulated_adata, spatial_simulated_adata, tree_distance_matrix, spatial_distance_matrix, 
             cell_type_assignments, cell_type_signatures, clade_column='clade_level2', gamma_ref=None,
-            eps=0.01, T_sinkhorn=100, J_alt=3, n_iters=1000, lr=1e-1, clade_to_ignore='NA', alpha=0.5, spot_scales_ref=None, max_exp_ratio=25.0):
-    
-    C_feature, C_tree, C_space, a, b = prepare_ot_inputs(ss_simulated_adata, spatial_simulated_adata, tree_distance_matrix, spatial_distance_matrix)
+            eps=0.01, T_sinkhorn=100, J_alt=3, n_iters=1000, lr=1e-2, clade_to_ignore='NA', alpha=0.5, spot_scales_ref=None, max_exp_ratio=25.0, seed=42,
+            **early_stop_kwargs):
+    np.random.seed(seed)
+    jax.random.PRNGKey(seed)
+    non_marker_genes = np.where(np.sum(cell_type_signatures == 1, axis=0) == cell_type_signatures.shape[0])[0]
+    C_feature, C_tree, C_space, a, b = prepare_ot_inputs(ss_simulated_adata[:,non_marker_genes], spatial_simulated_adata[:,non_marker_genes], tree_distance_matrix, spatial_distance_matrix)
 
     # Initialize with features only OT
     gamma0, uv0 = sinkhorn_fgw(C_feature, C_tree, C_space, a, b, eps, 
@@ -1009,7 +1198,7 @@ def run_spotr(ss_simulated_adata, spatial_simulated_adata, tree_distance_matrix,
     train_mask = jnp.array(train_mask)
     alpha_init = jnp.array(alpha_init)
 
-    alpha_cross_init = jnp.array([alpha])
+    alpha_cross_init = jnp.array([1.])
     alpha_clades_init = np.full((n_clades,), alpha)
 
     celltype_omega = np.zeros((n_cells, n_celltypes))
@@ -1029,14 +1218,23 @@ def run_spotr(ss_simulated_adata, spatial_simulated_adata, tree_distance_matrix,
     celltype_omega = jnp.array(celltype_omega)
     Omega = jnp.array(Omega)
 
-    alpha_final, alphas_hist, loss_hist, coupling, alpha_cross, alpha_clades, alpha_cross_hist, alpha_clades_hist, spot_scales_hist, spot_scales = learn_alpha_gamma_cladexfgw_data(
+    # Set eps based on the initial cost matrix
+    sF_ref, sL_ref = make_cladexfgw_scales(C_feature, C_tree, C_space, a, b, gamma0, eps=eps)
+    print(sF_ref, sL_ref)
+    init_C = build_cladexfgw_cost(alpha_init, alpha_cross_init, alpha_clades_init, C_feature, C_tree, C_space, a, b, gamma0, celltype_omega, clade_omega, Omega, sF_ref, sL_ref)
+    q = jnp.quantile(jnp.abs(init_C), 0.99)   
+    eps = q / max_exp_ratio                            # target max|-C/eps| ≈ 25
+    print(f"eps: {eps}")
+
+    alpha_final, alphas_hist, loss_hist, coupling, alpha_cross, alpha_clades, alpha_cross_hist, alpha_clades_hist, spot_scales, spot_scales_hist, gene_scales_hist, gene_scales = learn_alpha_gamma_cladexfgw_data(
         C_feature, Y, C_tree, C_space, a, b,
         celltype_omega, clade_omega, Omega,
         cell_type_assignments, cell_type_signatures,
         eps=eps, T_sinkhorn=T_sinkhorn, J_alt=J_alt,
         K_outer=n_iters, lr=lr, alpha_init=alpha_init, alpha_clades_init=alpha_clades_init, alpha_cross_init=alpha_cross_init, train_mask=train_mask,
         gamma0=gamma0, uv0=None, 
-        spot_scales=spot_scales_ref
+        spot_scales=spot_scales_ref,
+        **early_stop_kwargs,
     )    
 
     results = {
@@ -1049,6 +1247,7 @@ def run_spotr(ss_simulated_adata, spatial_simulated_adata, tree_distance_matrix,
         'loss_hist': loss_hist,
         'coupling': coupling,
         'spot_scales': spot_scales,
+        'gene_scales': gene_scales,
     }
 
     return results
@@ -1056,12 +1255,15 @@ def run_spotr(ss_simulated_adata, spatial_simulated_adata, tree_distance_matrix,
 
 def run_spotr_coupled(ss_simulated_adata, spatial_simulated_adata, tree_distance_matrix, spatial_distance_matrix, true_coupling,
             clade_column='clade_level2',
-            eps=0.01, T_sinkhorn=100, J_alt=3, n_iters=1000, lr=1e-1, clade_to_ignore='NA', alpha=0.5, max_exp_ratio=25.0):
-    
+            eps=None, T_sinkhorn=100, J_alt=3, n_iters=1000, lr=1e-2, clade_to_ignore='NA', alpha=0.5, max_exp_ratio=25.0, seed=42,
+            **early_stop_kwargs):
+    np.random.seed(seed)
+    jax.random.PRNGKey(seed)
+
     C_feature, C_tree, C_space, a, b = prepare_ot_inputs(ss_simulated_adata, spatial_simulated_adata, tree_distance_matrix, spatial_distance_matrix)
 
     # Initialize with features only OT
-    gamma0, uv0 = sinkhorn_fgw(C_feature, C_tree, C_space, a, b, eps, 
+    gamma0, uv0 = sinkhorn_fgw(C_feature, C_tree, C_space, a, b, 0.01, 
                                 T_sinkhorn=50, J_alt=1, alpha=0., gamma0=None, uv0=None)
 
     Y = jnp.asarray(spatial_simulated_adata.layers['counts'])            
@@ -1082,7 +1284,7 @@ def run_spotr_coupled(ss_simulated_adata, spatial_simulated_adata, tree_distance
     train_mask = jnp.array(train_mask)
     alpha_init = jnp.array(alpha_init)
 
-    alpha_cross_init = jnp.array([alpha])
+    alpha_cross_init = jnp.array([1.])
     alpha_clades_init = np.full((n_clades,), alpha)
 
     celltype_omega = np.zeros((n_cells, n_celltypes))
@@ -1102,12 +1304,22 @@ def run_spotr_coupled(ss_simulated_adata, spatial_simulated_adata, tree_distance
     celltype_omega = jnp.array(celltype_omega)
     Omega = jnp.array(Omega)
 
+    if eps is None:
+        # Set eps based on the initial cost matrix
+        sF_ref, sL_ref = make_cladexfgw_scales(C_feature, C_tree, C_space, a, b, gamma0)
+
+        init_C = build_cladexfgw_cost(alpha_init, alpha_cross_init, alpha_clades_init, C_feature, C_tree, C_space, a, b, gamma0, celltype_omega, clade_omega, Omega, sF_ref, sL_ref)
+        q = jnp.quantile(jnp.abs(init_C), 0.99)   
+        eps = q / max_exp_ratio                            # target max|-C/eps| ≈ 25
+        print(f"eps: {eps}")
+
     alpha_final, alphas_hist, loss_hist, coupling, alpha_cross, alpha_clades, alpha_cross_hist, alpha_clades_hist = learn_alpha_gamma_cladexfgw(
         C_feature, true_coupling, C_tree, C_space, a, b,
         celltype_omega, clade_omega, Omega,
         eps=eps, T_sinkhorn=T_sinkhorn, J_alt=J_alt,
         K_outer=n_iters, lr=lr, alpha_init=alpha_init, alpha_clades_init=alpha_clades_init, alpha_cross_init=alpha_cross_init, train_mask=train_mask,
         gamma0=gamma0, uv0=None, 
+        **early_stop_kwargs,
     )    
 
     results = {
