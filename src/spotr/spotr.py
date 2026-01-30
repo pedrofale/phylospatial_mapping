@@ -97,16 +97,33 @@ def init_spot_gene_scales(Y, gamma, cell_type_assignments, cell_type_signatures,
     g0 = jnp.clip(jnp.exp(log_g), clip[0], clip[1])
     return s0, g0
 
-def deconvolution_loss(Y, spot_scales, gene_scales, gamma, cell_type_assignments, cell_type_signatures):
+def deconvolution_loss(Y, spot_scales, gene_scales, gamma, clone_assignments, clone_cnvs):
     """
     Outer loss: scalar function of the transport plan gamma [n, m].
     """
-    spot_cell_type_proportions = jnp.einsum('ji,ik->jk', gamma.T, cell_type_assignments)
-    spot_mean = jnp.einsum('jk,kg->jg', spot_cell_type_proportions, cell_type_signatures)
-    ll = tfp.distributions.Poisson(spot_mean * spot_scales * gene_scales).log_prob(Y).sum()    
+    spot_clone_proportions = jnp.einsum('ji,ik->jk', gamma.T, clone_assignments)
+    spot_mean = jnp.einsum('jk,kg->jg', spot_clone_proportions, gene_scales * clone_cnvs / 2.0) # divide by 2.0 because the CNVs are the copy number of the alleles
+    ll = tfp.distributions.Poisson(spot_mean * spot_scales).log_prob(Y).sum()    
     lp = tfp.distributions.Gamma(1., 1.).log_prob(spot_scales).sum()
     lp += tfp.distributions.Gamma(1., 1.).log_prob(gene_scales).sum()
     return -(ll + lp) # loss
+
+def deconvolution_loss_ls(Y, gamma, clone_assignments, clone_cnvs):
+    """
+    For normalized CNV profiles.
+    Outer loss: scalar function of the transport plan gamma [n, m].
+    """
+    spot_clone_proportions = jnp.einsum('ji,ik->jk', gamma.T, clone_assignments)
+    spot_mean = jnp.einsum('jk,kg->jg', spot_clone_proportions, clone_cnvs / 2.0) # divide by 2.0 because the CNVs are the copy number of the alleles
+    return jnp.mean((Y - spot_mean)**2)
+
+def deconvolution_loss_ls_subclones(Y, spot_clone_proportions, clone_cnvs, gene_scales):
+    """
+    Outer loss: scalar function of the transport plan gamma [n, m].
+    """
+    spot_mean = jnp.einsum('jk,kg->jg', spot_clone_proportions, gene_scales * clone_cnvs / 2.0) # divide by 2.0 because the CNVs are the copy number of the alleles
+    return jnp.mean((Y - spot_mean)**2)
+
 
 @jax.jit
 def compute_Lgw(C_T, C_S, a, b, gamma):

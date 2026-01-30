@@ -39,20 +39,35 @@ class ExpressionSimulator(DataSimulator):
         trait_signatures: np.ndarray,
         spatial_map: np.ndarray,
         spatial_program: np.ndarray,
-        random_seed: Optional[int] = None,
+        use_cnvs: Optional[bool] = False,
+        n_regions: Optional[int] = 1,
+        n_regions_per_division: Optional[int] = 1,
+        random_seed: Optional[int] = 42,
     ):
         self.trait_covariances = trait_covariances # gene-gene covariance matrix
         self.trait_cholesky = np.asarray(cholesky(self.trait_covariances.values, lower=True))
         self.trait_signatures = trait_signatures # trait-trait signature matrix
         self.spatial_map = spatial_map # spatial heatmap indicating the activity of the spatial program at each pixel
         self.spatial_program = spatial_program # spatial program indicating the activity of each trait
+        self.use_cnvs = use_cnvs
+        self.n_regions = n_regions
+        self.n_regions_per_division = n_regions_per_division
         self.random_seed = random_seed
         self.n_traits = trait_covariances.shape[0]
         self.n_genes = trait_signatures.shape[1]
         self.trait_names = ["T" + str(i) for i in range(self.n_traits)]
         self.gene_names = ["G" + str(i) for i in range(self.n_genes)]
         self.spatial_activation_name = 'spatial_activations'
-        
+        # Assign genes evenly to regions
+        genes_per_region = self.n_genes // self.n_regions
+        self.region_gene_map = {
+            region: [
+                i
+                for i in range(region * genes_per_region, (region + 1) * genes_per_region)
+            ]
+            for region in range(self.n_regions)
+        }
+
     def make_leaf_cov_matrix(self, phylotree):
         # Create covariance matrix for species from tree 
         species_cov_matrix = pd.DataFrame(index=phylotree.get_leaf_names(), columns=phylotree.get_leaf_names())
@@ -198,6 +213,76 @@ class ExpressionSimulator(DataSimulator):
         # leaf_trait_values = leaf_trait_values.reshape(self.n_leaves, -1, order='F') # leaves by genes
         # return pd.DataFrame(leaf_trait_values, index=self.leaf_names, columns=self.trait_covariances.index) # is this in the right order?
 
+    def sample_cnv(self, tree, clades=None, rates=None):
+        cnvs = {tree.root: np.zeros(self.n_genes) + 2}
+        region_cnvs = {tree.root: np.zeros(self.n_regions) + 2}
+
+        # Pre-compute clade definitions for branch-length rescaling, if provided
+        clade_sets = None
+        if clades is not None and rates is not None:
+            if len(clades) != len(rates):
+                raise ValueError("`clades` and `rates` must have the same length.")
+            clade_sets = [set(c) for c in clades]
+            # Cache leaves-in-subtree for each node to avoid repeated work
+            subtree_leaves_cache = {}
+
+            def _subtree_rate(node):
+                # Determine the rate multiplier for a node based on which clade
+                # (if any) fully contains all of its descendant leaves.
+                if node in subtree_leaves_cache:
+                    leaves_sub = subtree_leaves_cache[node]
+                else:
+                    leaves_sub = set(tree.leaves_in_subtree(node))
+                    subtree_leaves_cache[node] = leaves_sub
+
+                rate = 1.0
+                for clade_set, lam in zip(clade_sets, rates):
+                    # Node is inside a clade iff all of its descendants are
+                    # contained in that clade.
+                    if leaves_sub.issubset(clade_set):
+                        rate = float(lam)
+                        break
+                return rate
+        else:
+            _subtree_rate = lambda node: 1.0
+
+        for parent, child in tree.depth_first_traverse_edges(source=tree.root):
+            parent_cnvs = cnvs[parent]
+            parent_region_cnvs = region_cnvs[parent]
+            branch_length = tree.get_branch_length(parent, child)
+
+            # Rescale the branch length by the rate corresponding to the clade
+            # that contains this edge (if any).
+            rate = _subtree_rate(child)
+            scaled_branch_length = branch_length * rate
+
+            # Sample regions to be affected
+            affected_regions1 = np.random.choice(
+                self.n_regions,
+                size=min(
+                    int(self.n_regions_per_division * np.exp(scaled_branch_length)),
+                    self.n_regions,
+                ),
+                replace=False,
+            )
+            # If CNV of any region is 0, ignore that region
+            affected_regions = affected_regions1[parent_region_cnvs[affected_regions1] != 0]
+            affected_regions = affected_regions[parent_region_cnvs[affected_regions] == 2]
+            # Sample CNV events for the affected regions
+            events = np.random.choice([-1, 1], size=len(affected_regions), p=[0.5, 0.5])
+            gene_events = np.zeros(self.n_genes)
+            region_events = np.zeros(self.n_regions)
+            for i, region in enumerate(affected_regions):
+                gene_events[self.region_gene_map[region]] = events[i]        
+                region_events[region] = events[i]
+            cnvs[child] = parent_cnvs + gene_events
+            region_cnvs[child] = parent_region_cnvs + region_events
+            assert np.all(cnvs[child] >= 0)
+        cnvs = pd.DataFrame(cnvs).T
+        cnvs.columns = self.gene_names
+        cnvs = cnvs.loc[tree.leaves]
+        return cnvs
+
     def sample_spatial_effects(self, tree):
         # For each cell, check where in the grid it is
         leaf_spatial_effects = pd.DataFrame(index=self.leaf_names, columns=self.gene_names)
@@ -210,18 +295,35 @@ class ExpressionSimulator(DataSimulator):
             spatial_activations.loc[leaf, self.spatial_activation_name] = self.spatial_map[x, y]
         return leaf_spatial_effects, spatial_activations
 
-    def sample_combined_expression(self, tree, alpha=0.5, clades=None, rates=None):
+    def sample_baseline_expression(self):
+        return np.exp(np.random.normal(0, .1, size=(self.n_genes,)))
+
+    def sample_expression_noise(self, noise_std=0.5):
+        return np.exp(np.random.normal(0, noise_std, size=(self.n_leaves, self.n_genes)))
+
+    def sample_combined_expression(self, tree, alpha=0.5, clades=None, rates=None, noise_std=0.5):
         brownian_motion_activations = self.sample_brownian_motion(clades=clades, rates=rates)
         brownian_motion_proportions = np.exp(brownian_motion_activations) / np.sum(np.exp(brownian_motion_activations), axis=1).values[:, None]
         brownian_motion_expression = brownian_motion_proportions.dot(self.trait_signatures)
         spatial_expression, spatial_activations = self.sample_spatial_effects(tree)
-        expression = alpha*brownian_motion_expression + (1-alpha)*spatial_expression
-        return expression, brownian_motion_proportions, spatial_activations
+        clone_expression = brownian_motion_expression
+        noise = spatial_expression + self.sample_expression_noise(noise_std=noise_std)
+        expression = alpha*clone_expression + (1-alpha)*noise
+        cnvs = None
+        if self.use_cnvs:
+            cnvs = self.sample_cnv(tree, clades=clades, rates=rates)
+            baseline_expression = self.sample_baseline_expression()
+            clone_expression = clone_expression * baseline_expression*cnvs/2
+            expression = alpha*clone_expression + (1-alpha)*noise
+            expression[np.where(cnvs == 0)[0]] = 0.
+            
+        return expression, brownian_motion_proportions, spatial_activations, cnvs
 
     def overlay_data(
         self,
         tree: CassiopeiaTree,
         alpha: float = 0.5,
+        noise_std: float = 0.5,
         clades: Optional[List[List[str]]] = None,
         rates: Optional[List[float]] = None,
     ):
@@ -240,7 +342,7 @@ class ExpressionSimulator(DataSimulator):
         if not hasattr(self, 'leaf_cov_matrix'):
             phylotree = ete3.Tree(tree.get_newick())
             self.make_leaf_cov_matrix(phylotree)
-        expression, brownian_motion_activations, spatial_activations = self.sample_combined_expression(tree, alpha=alpha, clades=clades, rates=rates)
+        expression, brownian_motion_activations, spatial_activations, cnvs = self.sample_combined_expression(tree, alpha=alpha, noise_std=noise_std, clades=clades, rates=rates)
         
         # Set cell meta
         cell_meta = (
@@ -253,6 +355,12 @@ class ExpressionSimulator(DataSimulator):
         cell_meta[columns] = np.nan
         for leaf in tree.leaves:
             cell_meta.loc[leaf, columns] = expression.loc[leaf]
+
+        if self.use_cnvs:
+            columns = ['CNV_' + gene for gene in self.gene_names]
+            cell_meta[columns] = np.nan
+            for leaf in tree.leaves:
+                cell_meta.loc[leaf, columns] = cnvs.loc[leaf].values
 
         columns = self.trait_names
         cell_meta[columns] = np.nan
