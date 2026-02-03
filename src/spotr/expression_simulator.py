@@ -308,13 +308,13 @@ class ExpressionSimulator(DataSimulator):
         spatial_expression, spatial_activations = self.sample_spatial_effects(tree)
         clone_expression = brownian_motion_expression
         noise = spatial_expression + self.sample_expression_noise(noise_std=noise_std)
-        expression = alpha*clone_expression + (1-alpha)*noise
+        expression = clone_expression + noise
         cnvs = None
         if self.use_cnvs:
             cnvs = self.sample_cnv(tree, clades=clades, rates=rates)
             baseline_expression = self.sample_baseline_expression()
             clone_expression = clone_expression * baseline_expression*cnvs/2
-            expression = alpha*clone_expression + (1-alpha)*noise
+            expression = clone_expression + noise
             expression[np.where(cnvs == 0)[0]] = 0.
             
         return expression, brownian_motion_proportions, spatial_activations, cnvs
