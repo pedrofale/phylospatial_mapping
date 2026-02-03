@@ -35,21 +35,21 @@ def alpha_penalty(alpha, mF, mL, tau=1e-2, lam=1e-2):
     phi = jax.lax.stop_gradient(jnp.maximum((tau - S) / tau, 0.0))
     return lam * (alpha**2) * phi
 
-def _deconvolution_loss(Y, gamma, cell_type_assignments, cell_type_signatures, sigma):
+def _deconvolution_loss(Y, gamma, clone_assignments, clone_signatures, sigma):
     """
     Outer loss: scalar function of the transport plan gamma [n, m].
     """
-    spot_cell_type_proportions = jnp.einsum('ji,ik->jk', gamma.T * gamma.shape[1], cell_type_assignments)
-    spot_mean = jnp.einsum('jk,kg->jg', spot_cell_type_proportions, cell_type_signatures)
+    spot_cell_type_proportions = jnp.einsum('ji,ik->jk', gamma.T * gamma.shape[1], clone_assignments)
+    spot_mean = jnp.einsum('jk,kg->jg', spot_cell_type_proportions, clone_signatures)
     return -tfp.distributions.Normal(spot_mean, sigma).log_prob(Y).sum()
 
-def init_spot_scales(Y, gamma, cell_type_assignments, cell_type_signatures,
+def init_spot_scales(Y, gamma, clone_assignments, clone_signatures,
                      prior_a=1.0, prior_b=1.0, eps=1e-8, clip=(1e-3, 1e3)):
     # Y: [m, G], gamma: [n, m], assignments: [n, C], signatures: [C, G]
     # 1) spot-level clone proportions
-    spot_ct = jnp.einsum('ji,ic->jc', gamma.T * gamma.shape[1], cell_type_assignments)  # [m,C]
+    spot_ct = jnp.einsum('ji,ic->jc', gamma.T * gamma.shape[1], clone_assignments)  # [m,C]
     # 2) predicted means per gene (without scale)
-    mu = jnp.einsum('jc,cg->jg', spot_ct, cell_type_signatures)        # [m,G]
+    mu = jnp.einsum('jc,cg->jg', spot_ct, clone_signatures)        # [m,G]
     # 3) MAP init per spot
     num = jnp.sum(Y, axis=1) + (prior_a - 1.0)
     den = jnp.sum(mu, axis=1) + prior_b + eps
@@ -58,7 +58,7 @@ def init_spot_scales(Y, gamma, cell_type_assignments, cell_type_signatures,
     s0 = jnp.clip(s0, clip[0], clip[1])
     return s0
 
-def init_spot_gene_scales(Y, gamma, cell_type_assignments, cell_type_signatures,
+def init_spot_gene_scales(Y, gamma, clone_assignments, clone_signatures,
                           a_s=1.0, b_s=1.0, a_g=1.0, b_g=1.0,
                           iters=2, eps=1e-8, clip=(1e-4, 1e4)):
     """
@@ -67,8 +67,8 @@ def init_spot_gene_scales(Y, gamma, cell_type_assignments, cell_type_signatures,
     """
     # 1) compute mu_jg (predicted mean without scales)
     # spot_ct: [m,C], mu: [m,G]
-    spot_ct = jnp.einsum('ji,ic->jc', gamma.T, cell_type_assignments)
-    mu = jnp.einsum('jc,cg->jg', spot_ct, cell_type_signatures)
+    spot_ct = jnp.einsum('ji,ic->jc', gamma.T, clone_assignments)
+    mu = jnp.einsum('jc,cg->jg', spot_ct, clone_signatures)
 
     m, G = Y.shape
     s = jnp.ones((m,))
@@ -491,7 +491,7 @@ def sinkhorn_cladefgw(C_feature, C_tree, C_space, a, b, eps, omega, Omega, T_sin
     (gamma_star, uv_star), _ = jax.lax.scan(body, (gamma0, uv0), xs=None, length=J_alt)
     return gamma_star, uv_star    
 
-def make_step_fn_fgw(C_feature, Y, C_tree, C_space, a, b, eps, optimizer, cell_type_assignments, cell_type_signatures, sigma, sF_ref, sL_ref, T_sinkhorn=50, J_alt=3):
+def make_step_fn_fgw(C_feature, Y, C_tree, C_space, a, b, eps, optimizer, clone_assignments, clone_signatures, sigma, sF_ref, sL_ref, T_sinkhorn=50, J_alt=3):
     def loss_fn(beta, gamma_uv):
         gamma0, uv0 = gamma_uv
         alpha = jax.nn.sigmoid(beta)  # α ∈ (0,1)        
@@ -511,7 +511,7 @@ def make_step_fn_fgw(C_feature, Y, C_tree, C_space, a, b, eps, optimizer, cell_t
 
         (gamma_star, uv_star), _ = jax.lax.scan(body, (gamma0, uv0), xs=None, length=J_alt)
         
-        loss = deconvolution_loss(Y, gamma_star, cell_type_assignments, cell_type_signatures, sigma)
+        loss = deconvolution_loss(Y, gamma_star, clone_assignments, clone_signatures, sigma)
         return loss, ((gamma_star, uv_star), alpha)
 
     @jax.jit
@@ -525,7 +525,7 @@ def make_step_fn_fgw(C_feature, Y, C_tree, C_space, a, b, eps, optimizer, cell_t
 
 def learn_alpha_gamma_fgw(
     C_feature, Y, C_tree, C_space, a, b,
-    cell_type_assignments, cell_type_signatures, sigma,
+    clone_assignments, clone_signatures, sigma,
     eps=0.05, T_sinkhorn=50, J_alt=3,
     K_outer=200, lr=1e-2, beta0=0.0,
     gamma0=None, uv0=None,
@@ -546,7 +546,7 @@ def learn_alpha_gamma_fgw(
     beta = jnp.array(beta0)
     opt_state = optimizer.init(beta)
 
-    step = make_step_fn_fgw(C_feature, Y, C_tree, C_space, a, b, eps, optimizer, cell_type_assignments, cell_type_signatures, sigma, sF_ref, sL_ref, T_sinkhorn, J_alt)
+    step = make_step_fn_fgw(C_feature, Y, C_tree, C_space, a, b, eps, optimizer, clone_assignments, clone_signatures, sigma, sF_ref, sL_ref, T_sinkhorn, J_alt)
     print(f"Starting optimization with beta0={beta0}")
     gamma_uv = (gamma0, uv0)
     loss_hist, alpha_hist = [], []
@@ -566,7 +566,7 @@ def logit(x, eps=1e-6):
     x = jnp.clip(x, eps, 1 - eps)
     return jnp.log(x) - jnp.log1p(-x)
 
-def make_step_fn_cladefgw(C_feature, Y, C_tree, C_space, a, b, eps, optimizer, cell_type_assignments, cell_type_signatures, omega, Omega, sF_ref, sL_ref, T_sinkhorn=50, J_alt=3, train_mask=None, alpha_init=None):
+def make_step_fn_cladefgw(C_feature, Y, C_tree, C_space, a, b, eps, optimizer, clone_assignments, clone_signatures, omega, Omega, sF_ref, sL_ref, T_sinkhorn=50, J_alt=3, train_mask=None, alpha_init=None):
     if train_mask is None:
         # default: train all
         # infer K from omega
@@ -597,7 +597,7 @@ def make_step_fn_cladefgw(C_feature, Y, C_tree, C_space, a, b, eps, optimizer, c
 
         (gamma_star, uv_star), _ = jax.lax.scan(body, (gamma0, uv0), xs=None, length=J_alt)
 
-        loss = deconvolution_loss(Y, spot_scales, gene_scales, gamma_star, cell_type_assignments, cell_type_signatures)
+        loss = deconvolution_loss(Y, spot_scales, gene_scales, gamma_star, clone_assignments, clone_signatures)
         return loss, ((gamma_star, uv_star), alphas, spot_scales, gene_scales)
 
     @jax.jit
@@ -621,7 +621,7 @@ def softplus_inv(x):
 
 def learn_alpha_gamma_cladefgw(
     C_feature, Y, C_tree, C_space, a, b,
-    cell_type_assignments, cell_type_signatures,
+    clone_assignments, clone_signatures,
     omega, Omega,
     eps=0.05, T_sinkhorn=50, J_alt=3,
     K_outer=200, lr=1e-2, alpha_init=None, train_mask=None,
@@ -668,7 +668,7 @@ def learn_alpha_gamma_cladefgw(
     params = {"betas": betas, "s_raw": s_raw, "g_raw": g_raw}
     opt_state = optimizer.init(params)
 
-    step = make_step_fn_cladefgw(C_feature, Y, C_tree, C_space, a, b, eps, optimizer, cell_type_assignments, cell_type_signatures, omega, Omega, sF_ref, sL_ref, T_sinkhorn, J_alt, train_mask, alpha_init)
+    step = make_step_fn_cladefgw(C_feature, Y, C_tree, C_space, a, b, eps, optimizer, clone_assignments, clone_signatures, omega, Omega, sF_ref, sL_ref, T_sinkhorn, J_alt, train_mask, alpha_init)
 
     gamma_uv = (gamma0, uv0)
     loss_hist, alphas_hist, spot_scales_hist, gene_scales_hist = [], [], [], []
@@ -800,7 +800,7 @@ def prepare_ot_inputs(ss_simulated_adata, spatial_simulated_adata, tree_distance
 
     return C_feature, C_tree, C_space, a, b
 
-def gamma_skl(G, Gref, eps=1e-12):
+def _gamma_skl(G, Gref, eps=1e-12):
     """
     Symmetric KL between normalized couplings.
     """
@@ -809,6 +809,31 @@ def gamma_skl(G, Gref, eps=1e-12):
     kl_pq = jnp.sum(P * (jnp.log(P + eps) - jnp.log(Q + eps)))
     kl_qp = jnp.sum(Q * (jnp.log(Q + eps) - jnp.log(P + eps)))
     return 0.5 * (kl_pq + kl_qp)
+
+def gamma_skl(G, Gref, eps=1e-8):
+    """
+    Symmetric KL with extra safeguards against NaNs from underflow/degenerate couplings.
+    Works in float32/float64.
+    """
+    G = jnp.asarray(G)
+    Gref = jnp.asarray(Gref)
+
+    # If either coupling is completely zero (or non-finite), return +inf (or a big number)
+    sG = jnp.sum(G)
+    sR = jnp.sum(Gref)
+    bad = (~jnp.isfinite(sG)) | (~jnp.isfinite(sR)) | (sG <= 0) | (sR <= 0) \
+          | (~jnp.all(jnp.isfinite(G))) | (~jnp.all(jnp.isfinite(Gref)))
+    def _compute():
+        P = G / (sG + eps)
+        Q = Gref / (sR + eps)
+        # clip away from 0 to avoid log(0)
+        P = jnp.clip(P, eps, 1.0)
+        Q = jnp.clip(Q, eps, 1.0)
+        kl_pq = jnp.sum(P * (jnp.log(P) - jnp.log(Q)))
+        kl_qp = jnp.sum(Q * (jnp.log(Q) - jnp.log(P)))
+        return 0.5 * (kl_pq + kl_qp)
+
+    return jnp.where(bad, jnp.inf, _compute())
 
 def _mad_abs(M, eps=1e-12):
     return jnp.clip(jnp.median(jnp.abs(M)), eps, 1e12)
@@ -1049,7 +1074,7 @@ def learn_alpha_gamma_cladexfgw(
     alpha_final = jnp.where(train_mask > 0.5, alpha_final, alpha_init)
     return alpha_final, jnp.stack(alphas_hist, axis=1), jnp.array(loss_hist), gamma_uv[0], alpha_cross, alpha_clades, jnp.stack(alpha_cross_hist, axis=1), jnp.stack(alpha_clades_hist, axis=1)
 
-def make_step_fn_cladexfgw_data(C_feature, Y, C_tree, C_space, a, b, eps, optimizer, cell_type_assignments, cell_type_signatures, celltype_omega, clade_omega, Omega, sF_ref, sL_ref, T_sinkhorn=50, J_alt=3, train_mask=None, alpha_init=None, learn_scales=True):
+def make_step_fn_cladexfgw_data(C_feature, Y, C_tree, C_space, a, b, eps, optimizer, clone_assignments, clone_signatures, celltype_omega, clade_omega, Omega, sF_ref, sL_ref, T_sinkhorn=50, J_alt=3, train_mask=None, alpha_init=None, learn_scales=True):
     if train_mask is None:
         # default: train all
         train_mask = jnp.ones((celltype_omega.shape[1],), dtype=jnp.float32)
@@ -1084,7 +1109,7 @@ def make_step_fn_cladexfgw_data(C_feature, Y, C_tree, C_space, a, b, eps, optimi
 
         spot_scales = jax.nn.softplus(params['s_raw']) + 1e-6
         gene_scales = jax.nn.softplus(params['g_raw']) + 1e-6
-        loss = deconvolution_loss(Y, spot_scales, gene_scales, gamma_star, cell_type_assignments, cell_type_signatures)
+        loss = deconvolution_loss(Y, spot_scales, gene_scales, gamma_star, clone_assignments, clone_signatures)
         return loss, ((gamma_star, uv_star), alphas, alpha_cross, alpha_clades, spot_scales, gene_scales)
 
     @jax.jit
@@ -1104,7 +1129,7 @@ def make_step_fn_cladexfgw_data(C_feature, Y, C_tree, C_space, a, b, eps, optimi
 def learn_alpha_gamma_cladexfgw_data(
     C_feature, Y, C_tree, C_space, a, b,
     celltype_omega, clade_omega, Omega,
-    cell_type_assignments, cell_type_signatures,
+    clone_assignments, clone_signatures,
     eps=0.05, T_sinkhorn=50, J_alt=3,
     K_outer=200, lr=1e-2, alpha_init=None, alpha_clades_init=None, alpha_cross_init=None, train_mask=None,
     gamma0=None, uv0=None,
@@ -1139,7 +1164,7 @@ def learn_alpha_gamma_cladexfgw_data(
     betas = logit(alpha_init)
     beta_cross = logit(alpha_cross_init)
     beta_clades = logit(alpha_clades_init)
-    s_raw, g_raw = init_spot_gene_scales(Y, gamma0, cell_type_assignments, cell_type_signatures)
+    s_raw, g_raw = init_spot_gene_scales(Y, gamma0, clone_assignments, clone_signatures)
     s_raw = softplus_inv(s_raw)
     s_raw = jnp.array(s_raw[:,None])
     g_raw = softplus_inv(g_raw)
@@ -1151,7 +1176,7 @@ def learn_alpha_gamma_cladexfgw_data(
     params = {"betas": betas, "beta_cross": beta_cross, "beta_clades": beta_clades, "s_raw": s_raw, "g_raw": g_raw}
     opt_state = optimizer.init(params)
 
-    step = make_step_fn_cladexfgw_data(C_feature, Y, C_tree, C_space, a, b, eps, optimizer, cell_type_assignments, cell_type_signatures, celltype_omega, clade_omega, Omega, sF_ref, sL_ref, T_sinkhorn, J_alt, train_mask, alpha_init, learn_scales)
+    step = make_step_fn_cladexfgw_data(C_feature, Y, C_tree, C_space, a, b, eps, optimizer, clone_assignments, clone_signatures, celltype_omega, clade_omega, Omega, sF_ref, sL_ref, T_sinkhorn, J_alt, train_mask, alpha_init, learn_scales)
 
     gamma_uv = (gamma0, uv0)
     loss_hist, alphas_hist, alpha_cross_hist, alpha_clades_hist, spot_scales_hist, gene_scales_hist = [], [], [], [], [], []
@@ -1185,12 +1210,12 @@ def learn_alpha_gamma_cladexfgw_data(
 
 
 def run_spotr(ss_simulated_adata, spatial_simulated_adata, tree_distance_matrix, spatial_distance_matrix, 
-            cell_type_assignments, cell_type_signatures, clade_column='clade_level2', gamma_ref=None,
+            clone_assignments, clone_signatures, clade_column='clade_level2', gamma_ref=None,
             eps=0.01, T_sinkhorn=100, J_alt=3, n_iters=1000, lr=1e-2, clade_to_ignore='NA', alpha=0.5, spot_scales_ref=None, max_exp_ratio=25.0, seed=42,
             **early_stop_kwargs):
     np.random.seed(seed)
     jax.random.PRNGKey(seed)
-    non_marker_genes = np.where(np.sum(cell_type_signatures == 1, axis=0) == cell_type_signatures.shape[0])[0]
+    non_marker_genes = np.where(np.sum(clone_signatures == 1, axis=0) == clone_signatures.shape[0])[0]
     C_feature, C_tree, C_space, a, b = prepare_ot_inputs(ss_simulated_adata[:,non_marker_genes], spatial_simulated_adata[:,non_marker_genes], tree_distance_matrix, spatial_distance_matrix)
 
     # Initialize with features only OT
@@ -1246,7 +1271,7 @@ def run_spotr(ss_simulated_adata, spatial_simulated_adata, tree_distance_matrix,
     alpha_final, alphas_hist, loss_hist, coupling, alpha_cross, alpha_clades, alpha_cross_hist, alpha_clades_hist, spot_scales, spot_scales_hist, gene_scales_hist, gene_scales = learn_alpha_gamma_cladexfgw_data(
         C_feature, Y, C_tree, C_space, a, b,
         celltype_omega, clade_omega, Omega,
-        cell_type_assignments, cell_type_signatures,
+        clone_assignments, clone_signatures,
         eps=eps, T_sinkhorn=T_sinkhorn, J_alt=J_alt,
         K_outer=n_iters, lr=lr, alpha_init=alpha_init, alpha_clades_init=alpha_clades_init, alpha_cross_init=alpha_cross_init, train_mask=train_mask,
         gamma0=gamma0, uv0=None, 
@@ -1351,3 +1376,693 @@ def run_spotr_coupled(ss_simulated_adata, spatial_simulated_adata, tree_distance
     }
 
     return results    
+
+
+
+###########################################################
+
+def build_perclade_alpha_cost(
+    alpha_k,                    # [K] in [0,1]
+    C_feature, C_tree, C_space,
+    a, b, gamma,
+    omega,                      # [n,K] one-hot/soft, rows sum≈1
+    sF_ref, sL_ref,             # scalars, stop-grad
+    *,
+    use_decomp=False,
+    Omega=None,                 # [n,n] within mask if use_decomp
+    phi_k=None,                 # [K] in [0,1] if use_decomp
+    # stability knobs
+    s_min=1e-6, s_max=1e6,
+    rel_floor=5e-2,
+    s_lo=5e-1, s_hi=2.0
+):
+    """
+    Cost:
+      C_nm = (1 - alpha_row[n]) * Fhat_nm + alpha_row[n] * Lhat_nm
+    where alpha_row = omega @ alpha_k.
+
+    If use_decomp:
+      Lhat_nm = (1 - phi_row[n]) * Lcross_hat_nm + phi_row[n] * Lwithin_hat_nm
+      with phi_row = omega @ phi_k.
+    """
+    n, m = C_feature.shape
+    # 1) feature part
+    F_c = _dc_rect(C_feature, a, b)
+
+    # 2) structure part (single global L(gamma) OR decomposed)
+    if not use_decomp:
+        L = compute_Lgw(C_tree, C_space, a, b, gamma)   # [n,m]
+        L_c = _dc_rect(L, a, b)
+        # scalar scales (stop-grad)
+        sF = jax.lax.stop_gradient(jnp.clip(sF_ref, s_min, s_max))
+        sL = jax.lax.stop_gradient(jnp.clip(sL_ref, s_min, s_max))
+        F_hat = F_c / sF
+        L_hat = L_c / sL
+    else:
+        assert Omega is not None, "Omega must be provided when use_decomp=True"
+        assert phi_k is not None, "phi_k must be provided when use_decomp=True"
+        # within/cross linearized structure (still GW-linearized, just different masks)
+        L_within = compute_Lcladegw(C_tree, C_space, a, b, gamma, Omega)
+        L_cross  = compute_Lcladegw(C_tree, C_space, a, b, gamma, (1.0 - Omega))
+        Lw_c = _dc_rect(L_within, a, b)
+        Lx_c = _dc_rect(L_cross,  a, b)
+
+        sF = jax.lax.stop_gradient(jnp.clip(sF_ref, s_min, s_max))
+        sL = jax.lax.stop_gradient(jnp.clip(sL_ref, s_min, s_max))
+        F_hat  = F_c  / sF
+        Lw_hat = Lw_c / sL
+        Lx_hat = Lx_c / sL
+
+        phi_row = jnp.clip(omega @ phi_k, 0.0, 1.0)         # [n]
+        L_hat = (1.0 - phi_row)[:, None] * Lx_hat + phi_row[:, None] * Lw_hat
+
+    # 3) row-wise alpha
+    alpha_row = jnp.clip(omega @ alpha_k, 0.0, 1.0)          # [n]
+    C0 = (1.0 - alpha_row)[:, None] * F_hat + alpha_row[:, None] * L_hat
+
+    # 4) α-decoupled equalizer (per-clade, stop-grad) to keep |C| stable while learning α
+    #    Uses alpha_ref_k = stopgrad(alpha_k) so α doesn't "cheat" through scaling.
+    alpha_ref_k = jax.lax.stop_gradient(jnp.clip(alpha_k, 0.0, 1.0))        # [K]
+    # robust per-row magnitudes
+    mF_i = jnp.median(jnp.abs(F_hat), axis=1)                               # [n]
+    mL_i = jnp.median(jnp.abs(L_hat), axis=1)                               # [n]
+    cnt_k = jnp.maximum(omega.sum(axis=0), 1e-8)                            # [K]
+    mF_k = (omega.T @ mF_i) / cnt_k
+    mL_k = (omega.T @ mL_i) / cnt_k
+    mF_k = jax.lax.stop_gradient(jnp.clip(mF_k, s_min, s_max))
+    mL_k = jax.lax.stop_gradient(jnp.clip(mL_k, s_min, s_max))
+
+    mLk_safe = jnp.maximum(mL_k, rel_floor * mF_k)
+    den_k = (1.0 - alpha_ref_k) * mF_k + alpha_ref_k * mLk_safe
+    den_k = jnp.clip(den_k, s_min, s_max)
+    s_k = (mF_k + mL_k) / den_k
+    s_k = jnp.clip(s_k, s_lo, s_hi)
+    s_k = jax.lax.stop_gradient(s_k)
+
+    s_i = omega @ s_k                                                       # [n]
+    C = C0 * s_i[:, None]
+    return C
+
+
+def make_step_fn_perclade_alpha_data(
+    C_feature, Y, C_tree, C_space, a, b, eps,
+    optimizer,
+    clone_assignments, clone_signatures,
+    omega,                          # [n,K]
+    sF_ref, sL_ref,                 # scalars
+    *,
+    use_decomp=False,
+    Omega=None,
+    train_mask_alpha=None,          # [K] 1 train, 0 freeze
+    alpha_init=None,                # [K]
+    train_mask_phi=None,            # [K] optional
+    phi_init=None,                  # [K]
+    T_sinkhorn=50, J_alt=3,
+    learn_scales=True,
+    use_loss_ls=False               # if True: use deconvolution_loss_ls, no scale params
+):
+    K = omega.shape[1]
+    if train_mask_alpha is None:
+        train_mask_alpha = jnp.ones((K,), dtype=jnp.float32)
+    if alpha_init is None:
+        alpha_init = jnp.full((K,), 0.5)
+
+    if use_decomp:
+        if train_mask_phi is None:
+            train_mask_phi = jnp.ones((K,), dtype=jnp.float32)
+        if phi_init is None:
+            phi_init = jnp.full((K,), 0.5)
+
+    def loss_fn(params, gamma_uv):
+        gamma0, uv0 = gamma_uv
+
+        # --- parameters ---
+        alpha_k = jax.nn.sigmoid(params["beta_alpha"])
+        alpha_k = jnp.where(train_mask_alpha > 0.5, alpha_k, jax.lax.stop_gradient(alpha_init))
+        alpha_k = jnp.clip(alpha_k, 0.0, 0.999)  # avoid exact 1
+
+        if use_decomp:
+            phi_k = jax.nn.sigmoid(params["beta_phi"])
+            phi_k = jnp.where(train_mask_phi > 0.5, phi_k, jax.lax.stop_gradient(phi_init))
+            phi_k = jnp.clip(phi_k, 0.0, 1.0)
+        else:
+            phi_k = None
+
+        if not use_loss_ls:
+            spot_scales = jax.nn.softplus(params["s_raw"]) + 1e-6
+            gene_scales = jax.nn.softplus(params["g_raw"]) + 1e-6
+
+        # --- unrolled FGW ---
+        def one_round(gamma, uv):
+            C = build_perclade_alpha_cost(
+                alpha_k, C_feature, C_tree, C_space, a, b, gamma, omega,
+                sF_ref, sL_ref,
+                use_decomp=use_decomp, Omega=Omega, phi_k=phi_k
+            )
+            return sinkhorn_unrolled_safe(C, a, b, eps, T_sinkhorn, uv)
+
+        def body(carry, _):
+            gamma, uv = carry
+            gamma, uv = one_round(gamma, uv)
+            return (gamma, uv), None
+
+        (gamma_star, uv_star), _ = jax.lax.scan(body, (gamma0, uv0), xs=None, length=J_alt)
+
+        # --- outer likelihood ---
+        if use_loss_ls:
+            loss = deconvolution_loss_ls(Y, gamma_star, clone_assignments, clone_signatures)
+            aux = (gamma_star, uv_star, alpha_k, phi_k, None, None)
+        else:
+            loss = deconvolution_loss(Y, spot_scales, gene_scales, gamma_star, clone_assignments, clone_signatures)
+            aux = (gamma_star, uv_star, alpha_k, phi_k, spot_scales, gene_scales)
+        return loss, aux
+
+    @jax.jit
+    def step(params, opt_state, gamma_uv):
+        (loss_value, aux), g = jax.value_and_grad(loss_fn, has_aux=True)(params, gamma_uv)
+
+        # freeze alphas/phis if requested
+        g["beta_alpha"] = g["beta_alpha"] * train_mask_alpha
+        if use_decomp:
+            g["beta_phi"] = g["beta_phi"] * train_mask_phi
+
+        if not use_loss_ls and not learn_scales:
+            g["s_raw"] = g["s_raw"] * 0.0
+
+        updates, opt_state = optimizer.update(g, opt_state, params=params)
+        updates["beta_alpha"] = updates["beta_alpha"] * train_mask_alpha
+        if use_decomp:
+            updates["beta_phi"] = updates["beta_phi"] * train_mask_phi
+        if not use_loss_ls and not learn_scales:
+            updates["s_raw"] = updates["s_raw"] * 0.0
+
+        params = optax.apply_updates(params, updates)
+
+        gamma_star, uv_star, alpha_k, phi_k, spot_scales, gene_scales = aux
+        return params, opt_state, (gamma_star, uv_star), loss_value, alpha_k, phi_k, spot_scales, gene_scales
+
+    return step
+
+
+def learn_alpha_gamma_perclade_alpha_data(
+    C_feature, Y, C_tree, C_space, a, b,
+    clone_assignments, clone_signatures,
+    omega,
+    *,
+    use_decomp=False,
+    Omega=None,
+    eps=0.05, T_sinkhorn=50, J_alt=3,
+    K_outer=200, lr=1e-2,
+    alpha_init=None, train_mask_alpha=None,
+    phi_init=None, train_mask_phi=None,
+    gamma0=None, uv0=None,
+    spot_scales_ref=None,
+    use_loss_ls=False,              # if True: use deconvolution_loss_ls, no scale params
+    early_stop_patience=10,
+    early_stop_delta=1e-6,
+    warmup=50,                      # don't trigger early stop until after this many iters
+):
+    n = a.shape[0]
+    K = omega.shape[1]
+
+    if alpha_init is None:
+        alpha_init = jnp.full((K,), 0.5)
+    if train_mask_alpha is None:
+        train_mask_alpha = jnp.ones((K,), dtype=jnp.float32)
+
+    if use_decomp:
+        if phi_init is None:
+            phi_init = jnp.full((K,), 0.5)
+        if train_mask_phi is None:
+            train_mask_phi = jnp.ones((K,), dtype=jnp.float32)
+
+    if gamma0 is None:
+        gamma0 = a[:, None] * b[None, :]
+    if uv0 is None:
+        uv0 = (jnp.ones_like(a), jnp.ones_like(b))
+
+    # Fixed scales for interpretability/stability (global)
+    sF_ref, sL_ref = make_cladexfgw_scales(C_feature, C_tree, C_space, a, b, gamma0, eps=eps)
+
+    if use_loss_ls:
+        params = {"beta_alpha": logit(alpha_init)}
+        learn_scales = False
+    else:
+        s0, g0 = init_spot_gene_scales(Y, gamma0, clone_assignments, clone_signatures)
+        s_raw = softplus_inv(s0)[:, None]
+        g_raw = softplus_inv(g0)[None, :]
+        learn_scales = True
+        if spot_scales_ref is not None:
+            s_raw = softplus_inv(jnp.asarray(spot_scales_ref))[:, None]
+            learn_scales = False
+        params = {
+            "beta_alpha": logit(alpha_init),
+            "s_raw": jnp.array(s_raw),
+            "g_raw": jnp.array(g_raw),
+        }
+    if use_decomp:
+        params["beta_phi"] = logit(phi_init)
+
+    optimizer = optax.adam(lr)
+    opt_state = optimizer.init(params)
+
+    step = make_step_fn_perclade_alpha_data(
+        C_feature, Y, C_tree, C_space, a, b, eps,
+        optimizer,
+        clone_assignments, clone_signatures,
+        omega, sF_ref, sL_ref,
+        use_decomp=use_decomp, Omega=Omega,
+        train_mask_alpha=train_mask_alpha, alpha_init=alpha_init,
+        train_mask_phi=train_mask_phi, phi_init=phi_init,
+        T_sinkhorn=T_sinkhorn, J_alt=J_alt,
+        learn_scales=learn_scales,
+        use_loss_ls=use_loss_ls
+    )
+
+    gamma_uv = (gamma0, uv0)
+    loss_hist = []
+    alpha_hist = []
+    phi_hist = []
+    spot_scales_hist = []
+    gene_scales_hist = []
+
+    best_loss = float("inf")
+    patience = 0
+
+    with tqdm(range(K_outer)) as pbar:
+        for _ in pbar:
+            params, opt_state, gamma_uv, loss_value, alpha_k, phi_k, spot_scales, gene_scales = step(params, opt_state, gamma_uv)
+            loss = float(loss_value)
+            loss_hist.append(loss)
+            alpha_hist.append(alpha_k)
+            if use_decomp:
+                phi_hist.append(phi_k)
+            if not use_loss_ls:
+                spot_scales_hist.append(spot_scales)
+                gene_scales_hist.append(gene_scales)
+
+            pbar.set_postfix({"loss": loss})
+
+            if len(loss_hist) > warmup:
+                if loss < best_loss - early_stop_delta:
+                    best_loss = loss
+                    patience = 0
+                else:
+                    patience += 1
+                if patience >= early_stop_patience:
+                    break
+            else:
+                # still track best, but don't stop yet
+                best_loss = min(best_loss, loss)
+
+    alpha_final = jax.nn.sigmoid(params["beta_alpha"])
+    alpha_final = jnp.where(train_mask_alpha > 0.5, alpha_final, alpha_init)
+
+    if use_decomp:
+        phi_final = jax.nn.sigmoid(params["beta_phi"])
+        phi_final = jnp.where(train_mask_phi > 0.5, phi_final, phi_init)
+    else:
+        phi_final = None
+
+    out = {
+        "alpha": alpha_final,
+        "alpha_hist": jnp.stack(alpha_hist, axis=1) if len(alpha_hist) else None,
+        "phi": phi_final,
+        "phi_hist": (jnp.stack(phi_hist, axis=1) if (use_decomp and len(phi_hist)) else None),
+        "loss_hist": jnp.array(loss_hist),
+        "coupling": gamma_uv[0],
+        "sF_ref": sF_ref,
+        "sL_ref": sL_ref,
+    }
+    if use_loss_ls:
+        out["spot_scales"] = None
+        out["gene_scales"] = None
+        out["spot_scales_hist"] = None
+        out["gene_scales_hist"] = None
+    else:
+        out["spot_scales"] = spot_scales
+        out["gene_scales"] = gene_scales
+        out["spot_scales_hist"] = jnp.stack(spot_scales_hist, axis=1) if len(spot_scales_hist) else None
+        out["gene_scales_hist"] = jnp.stack(gene_scales_hist, axis=1) if len(gene_scales_hist) else None
+    return out
+
+
+def run_spotr_perclade_alpha(
+    ss_simulated_adata, spatial_simulated_adata,
+    tree_distance_matrix, spatial_distance_matrix,
+    clone_assignments, clone_signatures,
+    *,
+    spot_layer="counts",
+    clade_column="clade_level2",
+    clade_to_ignore="NA",
+    # OT / optimization (eps=None: auto-set from q99/max_exp_ratio)
+    eps=None,
+    max_exp_ratio=25.0,
+    T_sinkhorn=100,
+    J_alt=3,
+    n_iters=1000,
+    lr=1e-2,
+    # alpha/phi settings
+    alpha=0.5,
+    use_decomp=False,
+    phi=0.5,
+    # loss: use_loss_ls=True uses deconvolution_loss_ls (no spot/gene scales)
+    use_loss_ls=True,
+    spot_scales_ref=None,  # only used when use_loss_ls=False
+    seed=42,
+    **early_stop_kwargs
+):
+    """
+    run_spotr with per-clade alpha:
+      - learns alpha_k per clade (row-wise mixing)
+      - by default uses deconvolution_loss_ls (no gene/spot scale learning)
+      - structural cost is global L(gamma) by default
+      - optional within/cross decomposition using per-clade phi_k
+    """
+    np.random.seed(seed)
+    _ = jax.random.PRNGKey(seed)
+
+    # keep your "non_marker_genes" logic
+    non_marker_genes = np.where(np.sum(clone_signatures == 1, axis=0) == clone_signatures.shape[0])[0]
+    if non_marker_genes.size == 0:
+        non_marker_genes = np.arange(clone_signatures.shape[1])
+    C_feature, C_tree, C_space, a, b = prepare_ot_inputs(
+        ss_simulated_adata[:, non_marker_genes],
+        spatial_simulated_adata[:, non_marker_genes],
+        tree_distance_matrix,
+        spatial_distance_matrix
+    )
+
+    # init gamma0 with FEATURES-ONLY OT (alpha=0 -> only feature cost in build_fgw_cost)
+    gamma0, _ = sinkhorn_fgw(
+        C_feature, C_tree, C_space, a, b, 0.01 if eps is None else eps,
+        T_sinkhorn=50, J_alt=1, alpha=0.0, gamma0=None, uv0=None
+    )
+
+    Y = jnp.asarray(spatial_simulated_adata.layers[spot_layer])
+    n_cells = ss_simulated_adata.shape[0]
+
+    # --- clade omega (row->clade) ---
+    cell_clades = np.asarray(ss_simulated_adata.obs[clade_column].values)
+    clades = np.unique(cell_clades)
+    K = len(clades)
+    clade_to_idx = {c: i for i, c in enumerate(clades)}
+
+    omega = np.zeros((n_cells, K), dtype=np.float32)
+    for i, c in enumerate(cell_clades):
+        omega[i, clade_to_idx[c]] = 1.0
+    omega = jnp.asarray(omega)
+
+    # --- train mask per clade (THIS fixes the bug in your old run_spotr: mask must be length K, not n_cells) ---
+    alpha_init = np.full((K,), alpha, dtype=np.float32)
+    train_mask_alpha = np.ones((K,), dtype=np.float32)
+
+    if clade_to_ignore in clades:
+        k_ignore = clade_to_idx[clade_to_ignore]
+        train_mask_alpha[k_ignore] = 0.0
+        alpha_init[k_ignore] = 0.0
+
+    alpha_init = jnp.asarray(alpha_init)
+    train_mask_alpha = jnp.asarray(train_mask_alpha)
+
+    # optional phi (only used if use_decomp)
+    if use_decomp:
+        phi_init = np.full((K,), phi, dtype=np.float32)
+        train_mask_phi = np.ones((K,), dtype=np.float32)
+        if clade_to_ignore in clades:
+            k_ignore = clade_to_idx[clade_to_ignore]
+            train_mask_phi[k_ignore] = 0.0
+            phi_init[k_ignore] = 0.5
+        phi_init = jnp.asarray(phi_init)
+        train_mask_phi = jnp.asarray(train_mask_phi)
+
+        # within-mask Omega from clade blocks
+        Omega = (omega @ omega.T).astype(jnp.float32)
+    else:
+        phi_init = None
+        train_mask_phi = None
+        Omega = None
+
+    # Fixed scales (same eps logic as run_spotr_coupled_perclade_alpha)
+    sF_ref, sL_ref = make_cladexfgw_scales(C_feature, C_tree, C_space, a, b, gamma0, eps=(0.05 if eps is None else eps))
+
+    # If eps not provided, set it from initial cost q99/max_exp_ratio
+    if eps is None:
+        init_C = build_perclade_alpha_cost(
+            alpha_init, C_feature, C_tree, C_space, a, b, gamma0, omega, sF_ref, sL_ref,
+            use_decomp=use_decomp, Omega=Omega, phi_k=phi_init
+        )
+        q = jnp.quantile(jnp.abs(init_C), 0.99)
+        eps = q / max_exp_ratio
+        print(f"[run_spotr_perclade_alpha] eps set to {float(eps):.4g} from q99/max_exp_ratio")
+
+    results = learn_alpha_gamma_perclade_alpha_data(
+        C_feature, Y, C_tree, C_space, a, b,
+        clone_assignments, clone_signatures,
+        omega,
+        use_decomp=use_decomp, Omega=Omega,
+        eps=eps, T_sinkhorn=T_sinkhorn, J_alt=J_alt,
+        K_outer=n_iters, lr=lr,
+        alpha_init=alpha_init, train_mask_alpha=train_mask_alpha,
+        phi_init=phi_init, train_mask_phi=train_mask_phi,
+        gamma0=gamma0, uv0=None,
+        spot_scales_ref=None if use_loss_ls else spot_scales_ref,
+        use_loss_ls=use_loss_ls,
+        **early_stop_kwargs
+    )
+
+    # package clade-labeled outputs
+    alpha_by_clade = dict(zip(clades, np.array(results["alpha"])))
+    if use_decomp:
+        phi_by_clade = dict(zip(clades, np.array(results["phi"])))
+    else:
+        phi_by_clade = None
+
+    out = {
+        **results,
+        "clades": clades,
+        "alpha_by_clade": alpha_by_clade,
+        "phi_by_clade": phi_by_clade
+    }
+    return out
+
+
+def run_spotr_coupled_perclade_alpha(
+    ss_simulated_adata, spatial_simulated_adata,
+    tree_distance_matrix, spatial_distance_matrix,
+    true_coupling,
+    *,
+    clade_column="clade_level2",
+    clade_to_ignore="NA",
+    # OT / optimization
+    eps=None,
+    max_exp_ratio=25.0,
+    T_sinkhorn=100,
+    J_alt=3,
+    n_iters=1000,
+    lr=1e-2,
+    # alpha/phi settings
+    alpha=0.5,
+    use_decomp=False,
+    phi=0.5,
+    seed=42,
+    **early_stop_kwargs
+):
+    """
+    Coupled version (supervised): learns per-clade alpha_k (and optional per-clade phi_k)
+    by minimizing symmetric KL between learned coupling and provided true_coupling.
+
+    - If use_decomp=False: structure uses global L(gamma).
+    - If use_decomp=True : structure is split into within/cross via Omega and per-clade phi_k.
+
+    Returns dict with alpha/phi, histories, coupling, loss_hist, plus clade-labeled outputs.
+    """
+    import numpy as np
+    import jax
+    import jax.numpy as jnp
+    import optax
+    from tqdm import tqdm
+
+    np.random.seed(seed)
+    _ = jax.random.PRNGKey(seed)
+
+    # Prepare OT inputs (features for FGW init)
+    C_feature, C_tree, C_space, a, b = prepare_ot_inputs(
+        ss_simulated_adata,
+        spatial_simulated_adata,
+        tree_distance_matrix,
+        spatial_distance_matrix
+    )
+
+    # Init gamma0 with FEATURES-ONLY OT
+    gamma0, _ = sinkhorn_fgw(
+        C_feature, C_tree, C_space, a, b, 0.01,
+        T_sinkhorn=50, J_alt=1, alpha=0.0, gamma0=None, uv0=None
+    )
+
+    n_cells = ss_simulated_adata.shape[0]
+    true_coupling = jnp.asarray(true_coupling)
+
+    # --- clade omega (row->clade) ---
+    cell_clades = np.asarray(ss_simulated_adata.obs[clade_column].values)
+    clades = np.unique(cell_clades)
+    K = len(clades)
+    clade_to_idx = {c: i for i, c in enumerate(clades)}
+
+    omega = np.zeros((n_cells, K), dtype=np.float32)
+    for i, c in enumerate(cell_clades):
+        omega[i, clade_to_idx[c]] = 1.0
+    omega = jnp.asarray(omega)
+
+    # --- train mask per clade ---
+    alpha_init = np.full((K,), alpha, dtype=np.float32)
+    train_mask_alpha = np.ones((K,), dtype=np.float32)
+    if clade_to_ignore in clades:
+        k_ignore = clade_to_idx[clade_to_ignore]
+        train_mask_alpha[k_ignore] = 0.0
+        alpha_init[k_ignore] = 0.0
+    alpha_init = jnp.asarray(alpha_init)
+    train_mask_alpha = jnp.asarray(train_mask_alpha)
+
+    # optional phi / Omega
+    if use_decomp:
+        phi_init = np.full((K,), phi, dtype=np.float32)
+        train_mask_phi = np.ones((K,), dtype=np.float32)
+        if clade_to_ignore in clades:
+            k_ignore = clade_to_idx[clade_to_ignore]
+            train_mask_phi[k_ignore] = 0.0
+            phi_init[k_ignore] = 0.5
+        phi_init = jnp.asarray(phi_init)
+        train_mask_phi = jnp.asarray(train_mask_phi)
+        Omega = (omega @ omega.T).astype(jnp.float32)
+    else:
+        phi_init = None
+        train_mask_phi = None
+        Omega = None
+
+    # Fixed scales
+    sF_ref, sL_ref = make_cladexfgw_scales(C_feature, C_tree, C_space, a, b, gamma0, eps=(0.05 if eps is None else eps))
+
+    # If eps not provided, set it from initial cost q99/max_exp_ratio
+    if eps is None:
+        init_C = build_perclade_alpha_cost(
+            alpha_init, C_feature, C_tree, C_space, a, b, gamma0, omega, sF_ref, sL_ref,
+            use_decomp=use_decomp, Omega=Omega, phi_k=phi_init
+        )
+        q = jnp.quantile(jnp.abs(init_C), 0.99)
+        eps = q / max_exp_ratio
+        print(f"[run_spotr_coupled_perclade_alpha] eps set to {float(eps):.4g} from q99/max_exp_ratio")
+
+    # --- build coupled training step (loss = gamma_skl) ---
+    def make_step_fn():
+        def loss_fn(params, gamma_uv):
+            gamma0_, uv0_ = gamma_uv
+            alpha_k = jax.nn.sigmoid(params["beta_alpha"])
+            alpha_k = jnp.where(train_mask_alpha > 0.5, alpha_k, jax.lax.stop_gradient(alpha_init))
+            alpha_k = jnp.clip(alpha_k, 0.0, 0.999)
+
+            if use_decomp:
+                phi_k = jax.nn.sigmoid(params["beta_phi"])
+                phi_k = jnp.where(train_mask_phi > 0.5, phi_k, jax.lax.stop_gradient(phi_init))
+                phi_k = jnp.clip(phi_k, 0.0, 1.0)
+            else:
+                phi_k = None
+
+            def one_round(gamma, uv):
+                C = build_perclade_alpha_cost(
+                    alpha_k, C_feature, C_tree, C_space, a, b, gamma, omega, sF_ref, sL_ref,
+                    use_decomp=use_decomp, Omega=Omega, phi_k=phi_k
+                )
+                return sinkhorn_unrolled_safe(C, a, b, eps, T_sinkhorn, uv)
+
+            def body(carry, _):
+                gamma, uv = carry
+                gamma, uv = one_round(gamma, uv)
+                return (gamma, uv), None
+
+            (gamma_star, uv_star), _ = jax.lax.scan(body, (gamma0_, uv0_), xs=None, length=J_alt)
+
+            loss = gamma_skl(gamma_star, true_coupling)
+            aux = (gamma_star, uv_star, alpha_k, phi_k)
+            return loss, aux
+
+        @jax.jit
+        def step(params, opt_state, gamma_uv):
+            (loss_value, aux), g = jax.value_and_grad(loss_fn, has_aux=True)(params, gamma_uv)
+            g["beta_alpha"] = g["beta_alpha"] * train_mask_alpha
+            if use_decomp:
+                g["beta_phi"] = g["beta_phi"] * train_mask_phi
+            updates, opt_state = optimizer.update(g, opt_state, params=params)
+            updates["beta_alpha"] = updates["beta_alpha"] * train_mask_alpha
+            if use_decomp:
+                updates["beta_phi"] = updates["beta_phi"] * train_mask_phi
+            params = optax.apply_updates(params, updates)
+            gamma_star, uv_star, alpha_k, phi_k = aux
+            return params, opt_state, (gamma_star, uv_star), loss_value, alpha_k, phi_k
+
+        return step
+
+    optimizer = optax.adam(lr)
+    params = {"beta_alpha": logit(alpha_init)}
+    if use_decomp:
+        params["beta_phi"] = logit(phi_init)
+    opt_state = optimizer.init(params)
+
+    step = make_step_fn()
+    gamma_uv = (gamma0, (jnp.ones_like(a), jnp.ones_like(b)))
+
+    loss_hist = []
+    alpha_hist = []
+    phi_hist = []
+
+    best_loss = float("inf")
+    patience = 0
+    early_stop_patience = early_stop_kwargs.get("early_stop_patience", 10)
+    early_stop_delta = early_stop_kwargs.get("early_stop_delta", 1e-6)
+    warmup = early_stop_kwargs.get("warmup", 50)
+
+    with tqdm(range(n_iters)) as pbar:
+        for _ in pbar:
+            params, opt_state, gamma_uv, loss_value, alpha_k, phi_k = step(params, opt_state, gamma_uv)
+            loss = float(loss_value)
+            loss_hist.append(loss)
+            alpha_hist.append(alpha_k)
+            if use_decomp:
+                phi_hist.append(phi_k)
+            pbar.set_postfix({"loss": loss})
+
+            if len(loss_hist) > warmup:
+                if loss < best_loss - early_stop_delta:
+                    best_loss = loss
+                    patience = 0
+                else:
+                    patience += 1
+                if patience >= early_stop_patience:
+                    break
+            else:
+                # still track best, but don't stop yet
+                best_loss = min(best_loss, loss)
+
+    alpha_final = jax.nn.sigmoid(params["beta_alpha"])
+    alpha_final = jnp.where(train_mask_alpha > 0.5, alpha_final, alpha_init)
+
+    if use_decomp:
+        phi_final = jax.nn.sigmoid(params["beta_phi"])
+        phi_final = jnp.where(train_mask_phi > 0.5, phi_final, phi_init)
+    else:
+        phi_final = None
+
+    return {
+        "clades": clades,
+        "alpha": alpha_final,
+        "alpha_by_clade": dict(zip(clades, np.array(alpha_final))),
+        "alpha_hist": (jnp.stack(alpha_hist, axis=1) if len(alpha_hist) else None),
+        "phi": phi_final,
+        "phi_by_clade": (dict(zip(clades, np.array(phi_final))) if use_decomp else None),
+        "phi_hist": (jnp.stack(phi_hist, axis=1) if (use_decomp and len(phi_hist)) else None),
+        "loss_hist": jnp.array(loss_hist),
+        "coupling": gamma_uv[0],
+        "eps": eps,
+        "sF_ref": sF_ref,
+        "sL_ref": sL_ref,
+    }    
